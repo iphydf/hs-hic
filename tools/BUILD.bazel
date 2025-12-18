@@ -1,0 +1,34 @@
+load("@rules_haskell//haskell:defs.bzl", "haskell_binary")
+
+haskell_binary(
+    name = "hic-check",
+    srcs = ["hic-check.hs"],
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//hs-cimple",
+        "//hs-hic:hic-ast-inference",
+        "//hs-hic:hic-core",
+        "//hs-hic:hic-refined",
+        "//hs-hic:hic-typesystem-core",
+        "//hs-hic:hic-typesystem-ordered",
+        "//hs-hic:hic-typesystem-standard",
+        "//hs-hic:hs-hic",
+        "//third_party/haskell:aeson",
+        "//third_party/haskell:base",
+        "//third_party/haskell:bytestring",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:groom",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:optparse-applicative",
+        "//third_party/haskell:prettyprinter",
+        "//third_party/haskell:prettyprinter-ansi-terminal",
+        "//third_party/haskell:process",
+        "//third_party/haskell:text",
+        "//third_party/haskell:time",
+    ],
+)

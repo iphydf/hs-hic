@@ -1,0 +1,198 @@
+name:          hic
+version:       0.0.0.1
+synopsis:      High Integrity Cimple (Hic) inference and lowering
+homepage:      https://toktok.github.io/
+license:       GPL-3
+license-file:  LICENSE
+author:        Iphigenia Df <iphydf@gmail.com>
+maintainer:    Iphigenia Df <iphydf@gmail.com>
+copyright:     Copyright (c) 2016-2026, Iphigenia Df
+category:      Data
+stability:     Experimental
+cabal-version: >=1.10
+build-type:    Simple
+description:
+  Reverse compiler for Cimple, inferring higher-level constructs from C-like code.
+
+library
+  default-language: Haskell2010
+  hs-source-dirs:   src
+  ghc-options:      -Wall
+  exposed-modules:
+    Language.Hic
+    Language.Hic.Ast
+    Language.Hic.Core.AlgebraicSolver
+    Language.Hic.Core.AstUtils
+    Language.Hic.Core.CFG
+    Language.Hic.Core.DataFlow
+    Language.Hic.Core.Errors
+    Language.Hic.Core.GraphAlgebra
+    Language.Hic.Core.Pretty
+    Language.Hic.Core.Scope
+    Language.Hic.Core.TypeSystem
+    Language.Hic.Core.Types
+    Language.Hic.Core.Worklist
+    Language.Hic.Inference
+    Language.Hic.Inference.Analyze
+    Language.Hic.Inference.Context
+    Language.Hic.Inference.Engine
+    Language.Hic.Inference.Feature
+    Language.Hic.Inference.Passes.Iteration
+    Language.Hic.Inference.Passes.Raise
+    Language.Hic.Inference.Passes.Scoped
+    Language.Hic.Inference.Passes.TaggedUnion
+    Language.Hic.Inference.Passes.Type
+    Language.Hic.Inference.Program
+    Language.Hic.Inference.Program.Types
+    Language.Hic.Inference.Utils
+    Language.Hic.Pretty
+    Language.Hic.Refined.Context
+    Language.Hic.Refined.Inference
+    Language.Hic.Refined.Inference.Lifter
+    Language.Hic.Refined.Inference.Substitution
+    Language.Hic.Refined.Inference.Translator
+    Language.Hic.Refined.Inference.Types
+    Language.Hic.Refined.Inference.Utils
+    Language.Hic.Refined.Lattice
+    Language.Hic.Refined.LatticeOp
+    Language.Hic.Refined.PathContext
+    Language.Hic.Refined.Pretty
+    Language.Hic.Refined.Registry
+    Language.Hic.Refined.SemanticEquality
+    Language.Hic.Refined.Solver
+    Language.Hic.Refined.State
+    Language.Hic.Refined.Transition
+    Language.Hic.Refined.Types
+    Language.Hic.TypeSystem.Core.Base
+    Language.Hic.TypeSystem.Core.BuiltinMap
+    Language.Hic.TypeSystem.Core.Builtins
+    Language.Hic.TypeSystem.Core.Canonicalization
+    Language.Hic.TypeSystem.Core.Constraints
+    Language.Hic.TypeSystem.Core.GraphSolver
+    Language.Hic.TypeSystem.Core.Lattice
+    Language.Hic.TypeSystem.Core.Qualification
+    Language.Hic.TypeSystem.Core.Solver
+    Language.Hic.TypeSystem.Core.Substitution
+    Language.Hic.TypeSystem.Core.Transition
+    Language.Hic.TypeSystem.Core.Transition.Atoms
+    Language.Hic.TypeSystem.Core.Transition.Types
+    Language.Hic.TypeSystem.Core.Transition.Variance
+    Language.Hic.TypeSystem.Core.TypeGraph
+    Language.Hic.TypeSystem.Ordered.ArrayUsage
+    Language.Hic.TypeSystem.Ordered.Base
+    Language.Hic.TypeSystem.Ordered.CallGraph
+    Language.Hic.TypeSystem.Ordered.ConstraintGeneration
+    Language.Hic.TypeSystem.Ordered.HotspotAnalysis
+    Language.Hic.TypeSystem.Ordered.Invariants
+    Language.Hic.TypeSystem.Ordered.Nullability
+    Language.Hic.TypeSystem.Ordered.Specializer
+    Language.Hic.TypeSystem.Ordered.Unification
+    Language.Hic.TypeSystem.Standard.Base
+    Language.Hic.TypeSystem.Standard.Constraints
+    Language.Hic.TypeSystem.Standard.Solver
+  build-depends:
+      aeson
+    , base                 <5
+    , cimple               >=0.0.28
+    , containers
+    , data-fix
+    , hashable
+    , mtl
+    , prettyprinter
+    , prettyprinter-ansi-terminal
+    , QuickCheck
+    , text
+    , time
+    , transformers-compat
+
+executable hic-check
+  default-language: Haskell2010
+  hs-source-dirs:   tools
+  ghc-options:      -Wall
+  main-is:          hic-check.hs
+  build-depends:
+      aeson
+    , base        <5
+    , bytestring
+    , cimple
+    , containers
+    , data-fix
+    , groom
+    , hic
+    , optparse-applicative
+    , prettyprinter
+    , prettyprinter-ansi-terminal
+    , process
+    , text
+    , time
+
+test-suite testsuite
+  type:               exitcode-stdio-1.0
+  default-language:   Haskell2010
+  hs-source-dirs:     test
+  main-is:            testsuite.hs
+  other-modules:
+    Language.Hic.Core.AlgebraicSolverSpec
+    Language.Hic.Core.DataFlowSpec
+    Language.Hic.Core.ErrorMessageSpec
+    Language.Hic.Core.GraphAlgebraSpec
+    Language.Hic.Core.ScopeSpec
+    Language.Hic.Core.TypeSystemSpec
+    Language.Hic.Inference.EngineSpec
+    Language.Hic.Inference.Passes.IterationSpec
+    Language.Hic.Inference.Passes.RaiseSpec
+    Language.Hic.Inference.Passes.ScopedSpec
+    Language.Hic.Inference.Passes.TaggedUnionSpec
+    Language.Hic.InferenceSpec
+    Language.Hic.Refined.Arbitrary
+    Language.Hic.Refined.ContextSpec
+    Language.Hic.Refined.Inference.LifterSpec
+    Language.Hic.Refined.Inference.SubstitutionSpec
+    Language.Hic.Refined.Inference.TranslatorSpec
+    Language.Hic.Refined.InferenceSpec
+    Language.Hic.Refined.LatticeOpSpec
+    Language.Hic.Refined.PathContextSpec
+    Language.Hic.Refined.SemanticEqualitySpec
+    Language.Hic.Refined.SolverSpec
+    Language.Hic.Refined.TransitionSpec
+    Language.Hic.TestUtils
+    Language.Hic.TypeSystem.Core.BaseSpec
+    Language.Hic.TypeSystem.Core.CanonicalizationSpec
+    Language.Hic.TypeSystem.Core.ConstraintsSpec
+    Language.Hic.TypeSystem.Core.GraphSolverSpec
+    Language.Hic.TypeSystem.Core.LatticeSpec
+    Language.Hic.TypeSystem.Core.QualificationSpec
+    Language.Hic.TypeSystem.Core.SolverSpec
+    Language.Hic.TypeSystem.Core.SubstitutionSpec
+    Language.Hic.TypeSystem.Core.Transition.AtomsSpec
+    Language.Hic.TypeSystem.Core.Transition.VarianceSpec
+    Language.Hic.TypeSystem.Core.TransitionSpec
+    Language.Hic.TypeSystem.Core.TypeGraphSpec
+    Language.Hic.TypeSystem.Ordered.ArrayUsageSpec
+    Language.Hic.TypeSystem.Ordered.BaseSpec
+    Language.Hic.TypeSystem.Ordered.CallGraphSpec
+    Language.Hic.TypeSystem.Ordered.ConstraintGenerationSpec
+    Language.Hic.TypeSystem.Ordered.HotspotAnalysisSpec
+    Language.Hic.TypeSystem.Ordered.InvariantsSpec
+    Language.Hic.TypeSystem.Ordered.NullabilitySpec
+    Language.Hic.TypeSystem.Ordered.SpecializerSpec
+    Language.Hic.TypeSystem.Ordered.UnificationSpec
+    Language.Hic.TypeSystem.Standard.BaseSpec
+    Language.Hic.TypeSystem.Standard.ConstraintsSpec
+    Language.Hic.TypeSystem.Standard.SolverSpec
+
+  ghc-options:        -Wall -Wno-unused-imports
+  build-tool-depends: hspec-discover:hspec-discover
+  build-depends:
+      base                 <5
+    , cimple
+    , containers
+    , data-fix
+    , groom
+    , hic
+    , hspec
+    , QuickCheck
+    , mtl
+    , prettyprinter
+    , prettyprinter-ansi-terminal
+    , text

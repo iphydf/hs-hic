@@ -1,0 +1,141 @@
+{-# LANGUAGE DataKinds         #-}
+{-# LANGUAGE OverloadedStrings #-}
+module Language.Hic.TypeSystem.Core.Builtins
+    ( builtins
+    ) where
+
+import           Data.Map.Strict              (Map)
+import qualified Data.Map.Strict              as Map
+import           Data.Text                    (Text)
+import qualified Language.Cimple              as C
+import           Language.Hic.Core.TypeSystem
+
+p :: C.AlexPosn
+p = C.AlexPn 0 0 0
+
+l :: Text -> C.Lexeme Text
+l = C.L p C.IdVar
+
+builtins :: Map Text (TypeDescr 'Global)
+builtins = Map.fromList
+    [ ("sockaddr", StructDescr (l "sockaddr") []
+        [ (l "sa_family", BuiltinType U16Ty)
+        , (l "sa_data", Array (Just (BuiltinType CharTy)) [IntLit (fmap TIdName $ l "14")])
+        ] [])
+    , ("sockaddr_in", StructDescr (l "sockaddr_in") []
+        [ (l "sin_family", BuiltinType U16Ty)
+        , (l "sin_port", BuiltinType U16Ty)
+        , (l "sin_addr", TypeRef StructRef (fmap TIdName $ l "in_addr") [])
+        ] [])
+    , ("sockaddr_in6", StructDescr (l "sockaddr_in6") []
+        [ (l "sin6_family", BuiltinType U16Ty)
+        , (l "sin6_port", BuiltinType U16Ty)
+        , (l "sin6_flowinfo", BuiltinType U32Ty)
+        , (l "sin6_addr", TypeRef StructRef (fmap TIdName $ l "in6_addr") [])
+        , (l "sin6_scope_id", BuiltinType U32Ty)
+        ] [])
+    , ("sockaddr_storage", StructDescr (l "sockaddr_storage") []
+        [ (l "ss_family", BuiltinType U16Ty)
+        ] [])
+    , ("in_addr", StructDescr (l "in_addr") []
+        [ (l "s_addr", BuiltinType U32Ty)
+        ] [])
+    , ("in6_addr", StructDescr (l "in6_addr") []
+        [ (l "s6_addr", Array (Just (BuiltinType U08Ty)) [IntLit (fmap TIdName $ l "16")])
+        ] [])
+    , ("addrinfo", StructDescr (l "addrinfo") []
+        [ (l "ai_flags", BuiltinType S32Ty)
+        , (l "ai_family", BuiltinType S32Ty)
+        , (l "ai_socktype", BuiltinType S32Ty)
+        , (l "ai_protocol", BuiltinType S32Ty)
+        , (l "ai_addrlen", BuiltinType U32Ty)
+        , (l "ai_addr", Pointer (TypeRef StructRef (fmap TIdName $ l "sockaddr") []))
+        , (l "ai_canonname", Pointer (BuiltinType CharTy))
+        , (l "ai_next", Pointer (TypeRef StructRef (fmap TIdName $ l "addrinfo") []))
+        ] [])
+    , ("ipv6_mreq", StructDescr (l "ipv6_mreq") []
+        [ (l "ipv6mr_multiaddr", TypeRef StructRef (fmap TIdName $ l "in6_addr") [])
+        , (l "ipv6mr_interface", BuiltinType U32Ty)
+        ] [])
+    , ("WSADATA", StructDescr (l "WSADATA") []
+        [ (l "wVersion", BuiltinType U16Ty)
+        , (l "wHighVersion", BuiltinType U16Ty)
+        , (l "szDescription", Array (Just (BuiltinType CharTy)) [IntLit (fmap TIdName $ l "257")])
+        , (l "szSystemStatus", Array (Just (BuiltinType CharTy)) [IntLit (fmap TIdName $ l "129")])
+        , (l "iMaxSockets", BuiltinType U16Ty)
+        , (l "iMaxUdpDg", BuiltinType U16Ty)
+        , (l "lpVendorInfo", Pointer (BuiltinType CharTy))
+        ] [])
+    , ("LPSOCKADDR", AliasDescr (l "LPSOCKADDR") [] (Pointer (TypeRef StructRef (fmap TIdName $ l "sockaddr") [])))
+    , ("LPWSAPROTOCOL_INFOA", StructDescr (l "LPWSAPROTOCOL_INFOA") [] [] [])
+    , ("memcpy", FuncDescr (l "memcpy") [TIdName "T"] (Pointer (Template (TIdName "T") Nothing)) [Pointer (Template (TIdName "T") Nothing), Pointer (Const (Template (TIdName "T") Nothing)), BuiltinType SizeTy])
+    , ("memset", FuncDescr (l "memset") [TIdName "T"] (Pointer (Template (TIdName "T") Nothing)) [Pointer (Template (TIdName "T") Nothing), BuiltinType S32Ty, BuiltinType SizeTy])
+    , ("memmove", FuncDescr (l "memmove") [TIdName "T"] (Pointer (Template (TIdName "T") Nothing)) [Pointer (Template (TIdName "T") Nothing), Pointer (Const (Template (TIdName "T") Nothing)), BuiltinType SizeTy])
+    , ("memcmp", FuncDescr (l "memcmp") [TIdName "T"] (BuiltinType S32Ty) [Pointer (Const (Template (TIdName "T") Nothing)), Pointer (Const (Template (TIdName "T") Nothing)), BuiltinType SizeTy])
+    , ("malloc", FuncDescr (l "malloc") [TIdName "T"] (Pointer (Template (TIdName "T") Nothing)) [BuiltinType SizeTy])
+    , ("free", FuncDescr (l "free") [TIdName "T"] (BuiltinType VoidTy) [Pointer (Template (TIdName "T") Nothing)])
+    , ("realloc", FuncDescr (l "realloc") [TIdName "T"] (Pointer (Template (TIdName "T") Nothing)) [Pointer (Template (TIdName "T") Nothing), BuiltinType SizeTy])
+    , ("assert", FuncDescr (l "assert") [] (BuiltinType VoidTy) [BuiltinType BoolTy])
+    , ("printf", FuncDescr (l "printf") [] (BuiltinType S32Ty) [Pointer (Const (BuiltinType CharTy)), VarArg])
+    , ("strrchr", FuncDescr (l "strrchr") [] (Pointer (Const (BuiltinType CharTy))) [Pointer (Const (BuiltinType CharTy)), BuiltinType S32Ty])
+    , ("strchr", FuncDescr (l "strchr") [] (Pointer (Const (BuiltinType CharTy))) [Pointer (Const (BuiltinType CharTy)), BuiltinType S32Ty])
+    , ("va_start", FuncDescr (l "va_start") [TIdName "T"] (BuiltinType VoidTy) [ExternalType (fmap TIdName $ l "va_list"), Template (TIdName "T") Nothing])
+    , ("vsnprintf", FuncDescr (l "vsnprintf") [] (BuiltinType S32Ty) [Pointer (BuiltinType CharTy), BuiltinType SizeTy, Pointer (Const (BuiltinType CharTy)), ExternalType (fmap TIdName $ l "va_list")])
+    , ("va_end", FuncDescr (l "va_end") [] (BuiltinType VoidTy) [ExternalType (fmap TIdName $ l "va_list")])
+    , ("abort", FuncDescr (l "abort") [] (BuiltinType VoidTy) [])
+    , ("uint32_c", FuncDescr (l "UINT32_C") [] (BuiltinType U32Ty) [BuiltinType S32Ty])
+    , ("uint64_c", FuncDescr (l "UINT64_C") [] (BuiltinType U64Ty) [BuiltinType S32Ty])
+    , ("int32_c", FuncDescr (l "INT32_C") [] (BuiltinType S32Ty) [BuiltinType S32Ty])
+    , ("int64_c", FuncDescr (l "INT64_C") [] (BuiltinType S64Ty) [BuiltinType S32Ty])
+    , ("errno", AliasDescr (l "errno") [] (BuiltinType S32Ty))
+    , ("inet_ntop", FuncDescr (l "inet_ntop") [TIdName "T"] (Pointer (BuiltinType CharTy)) [BuiltinType S32Ty, Pointer (Const (Template (TIdName "T") Nothing)), Pointer (BuiltinType CharTy), BuiltinType U32Ty])
+    , ("inet_pton", FuncDescr (l "inet_pton") [TIdName "T"] (BuiltinType S32Ty) [BuiltinType S32Ty, Pointer (Const (BuiltinType CharTy)), Pointer (Template (TIdName "T") Nothing)])
+    , ("htonl", FuncDescr (l "htonl") [] (BuiltinType U32Ty) [BuiltinType U32Ty])
+    , ("htons", FuncDescr (l "htons") [] (BuiltinType U16Ty) [BuiltinType U16Ty])
+    , ("ntohl", FuncDescr (l "ntohl") [] (BuiltinType U32Ty) [BuiltinType U32Ty])
+    , ("ntohs", FuncDescr (l "ntohs") [] (BuiltinType U16Ty) [BuiltinType U16Ty])
+    , ("socket", FuncDescr (l "socket") [] (BuiltinType S32Ty) [BuiltinType S32Ty, BuiltinType S32Ty, BuiltinType S32Ty])
+    , ("bind", FuncDescr (l "bind") [] (BuiltinType S32Ty) [BuiltinType S32Ty, Pointer (Const (TypeRef StructRef (fmap TIdName $ l "sockaddr") [])), BuiltinType U32Ty])
+    , ("listen", FuncDescr (l "listen") [] (BuiltinType S32Ty) [BuiltinType S32Ty, BuiltinType S32Ty])
+    , ("accept", FuncDescr (l "accept") [] (BuiltinType S32Ty) [BuiltinType S32Ty, Pointer (TypeRef StructRef (fmap TIdName $ l "sockaddr") []), Pointer (BuiltinType U32Ty)])
+    , ("connect", FuncDescr (l "connect") [] (BuiltinType S32Ty) [BuiltinType S32Ty, Pointer (Const (TypeRef StructRef (fmap TIdName $ l "sockaddr") [])), BuiltinType U32Ty])
+    , ("send", FuncDescr (l "send") [TIdName "T"] (BuiltinType S64Ty) [BuiltinType S32Ty, Pointer (Const (Template (TIdName "T") Nothing)), BuiltinType SizeTy, BuiltinType S32Ty])
+    , ("recv", FuncDescr (l "recv") [TIdName "T"] (BuiltinType S64Ty) [BuiltinType S32Ty, Template (TIdName "T") Nothing, BuiltinType SizeTy, BuiltinType S32Ty])
+    , ("sendto", FuncDescr (l "sendto") [TIdName "T"] (BuiltinType S64Ty) [BuiltinType S32Ty, Pointer (Const (Template (TIdName "T") Nothing)), BuiltinType SizeTy, BuiltinType S32Ty, Pointer (Const (TypeRef StructRef (fmap TIdName $ l "sockaddr") [])), BuiltinType U32Ty])
+    , ("recvfrom", FuncDescr (l "recvfrom") [TIdName "T"] (BuiltinType S64Ty) [BuiltinType S32Ty, Template (TIdName "T") Nothing, BuiltinType SizeTy, BuiltinType S32Ty, Pointer (TypeRef StructRef (fmap TIdName $ l "sockaddr") []), Pointer (BuiltinType U32Ty)])
+    , ("close", FuncDescr (l "close") [] (BuiltinType S32Ty) [BuiltinType S32Ty])
+    , ("closesocket", FuncDescr (l "closesocket") [] (BuiltinType S32Ty) [BuiltinType U32Ty])
+    , ("getsockopt", FuncDescr (l "getsockopt") [TIdName "T"] (BuiltinType S32Ty) [BuiltinType S32Ty, BuiltinType S32Ty, BuiltinType S32Ty, Pointer (Template (TIdName "T") Nothing), Pointer (BuiltinType U32Ty)])
+    , ("setsockopt", FuncDescr (l "setsockopt") [TIdName "T"] (BuiltinType S32Ty) [BuiltinType S32Ty, BuiltinType S32Ty, BuiltinType S32Ty, Pointer (Const (Template (TIdName "T") Nothing)), BuiltinType U32Ty])
+    , ("ioctl", FuncDescr (l "ioctl") [] (BuiltinType S32Ty) [BuiltinType S32Ty, BuiltinType U32Ty, VarArg])
+    , ("ioctlsocket", FuncDescr (l "ioctlsocket") [] (BuiltinType S32Ty) [BuiltinType U32Ty, BuiltinType S32Ty, Pointer (BuiltinType U32Ty)])
+    , ("fcntl", FuncDescr (l "fcntl") [] (BuiltinType S32Ty) [BuiltinType S32Ty, BuiltinType S32Ty, VarArg])
+    , ("getaddrinfo", FuncDescr (l "getaddrinfo") [] (BuiltinType S32Ty) [Pointer (Const (BuiltinType CharTy)), Pointer (Const (BuiltinType CharTy)), Pointer (Const (TypeRef StructRef (fmap TIdName $ l "addrinfo") [])), Pointer (Pointer (TypeRef StructRef (fmap TIdName $ l "addrinfo") []))])
+    , ("freeaddrinfo", FuncDescr (l "freeaddrinfo") [] (BuiltinType VoidTy) [Pointer (TypeRef StructRef (fmap TIdName $ l "addrinfo") [])])
+    , ("WSAStartup", FuncDescr (l "WSAStartup") [] (BuiltinType S32Ty) [BuiltinType U16Ty, Pointer (TypeRef StructRef (fmap TIdName $ l "WSADATA") [])])
+    , ("WSACleanup", FuncDescr (l "WSACleanup") [] (BuiltinType S32Ty) [])
+    , ("WSAGetLastError", FuncDescr (l "WSAGetLastError") [] (BuiltinType S32Ty) [])
+    , ("MAKEWORD", FuncDescr (l "MAKEWORD") [] (BuiltinType U16Ty) [BuiltinType U08Ty, BuiltinType U08Ty])
+    , ("FormatMessageA", FuncDescr (l "FormatMessageA") [TIdName "T"] (BuiltinType U32Ty) [BuiltinType U32Ty, Pointer (Const (Template (TIdName "T") Nothing)), BuiltinType U32Ty, BuiltinType U32Ty, Pointer (BuiltinType CharTy), BuiltinType U32Ty, Template (TIdName "T") Nothing])
+    , ("strerror_r", FuncDescr (l "strerror_r") [] (Pointer (Const (BuiltinType CharTy))) [BuiltinType S32Ty, Pointer (BuiltinType CharTy), BuiltinType SizeTy])
+    , ("snprintf", FuncDescr (l "snprintf") [] (BuiltinType S32Ty) [Pointer (BuiltinType CharTy), BuiltinType SizeTy, Pointer (Const (BuiltinType CharTy)), VarArg])
+    , ("strlen", FuncDescr (l "strlen") [] (BuiltinType SizeTy) [Pointer (Const (BuiltinType CharTy))])
+    , ("WSAAddressToString", FuncDescr (l "WSAAddressToString") [] (BuiltinType S32Ty) [Pointer (TypeRef StructRef (fmap TIdName $ l "sockaddr") []), BuiltinType U32Ty, Pointer (TypeRef StructRef (fmap TIdName $ l "LPWSAPROTOCOL_INFOA") []), Pointer (BuiltinType CharTy), Pointer (BuiltinType U32Ty)])
+    , ("WSAStringToAddress", FuncDescr (l "WSAStringToAddress") [] (BuiltinType S32Ty) [Pointer (BuiltinType CharTy), BuiltinType S32Ty, Pointer (TypeRef StructRef (fmap TIdName $ l "LPWSAPROTOCOL_INFOA") []), Pointer (TypeRef StructRef (fmap TIdName $ l "sockaddr") []), Pointer (BuiltinType S32Ty)])
+    , ("pthread_mutex_init", FuncDescr (l "pthread_mutex_init") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_mutex_t")), Pointer (Const (ExternalType (fmap TIdName $ l "pthread_mutexattr_t")))])
+    , ("pthread_mutex_destroy", FuncDescr (l "pthread_mutex_destroy") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_mutex_t"))])
+    , ("pthread_mutex_lock", FuncDescr (l "pthread_mutex_lock") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_mutex_t"))])
+    , ("pthread_mutex_unlock", FuncDescr (l "pthread_mutex_unlock") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_mutex_t"))])
+    , ("pthread_mutexattr_init", FuncDescr (l "pthread_mutexattr_init") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_mutexattr_t"))])
+    , ("pthread_mutexattr_settype", FuncDescr (l "pthread_mutexattr_settype") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_mutexattr_t")), BuiltinType S32Ty])
+    , ("pthread_mutexattr_destroy", FuncDescr (l "pthread_mutexattr_destroy") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_mutexattr_t"))])
+    , ("pthread_rwlock_init", FuncDescr (l "pthread_rwlock_init") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_rwlock_t")), Pointer (Const (ExternalType (fmap TIdName $ l "pthread_rwlockattr_t")))])
+    , ("pthread_rwlock_destroy", FuncDescr (l "pthread_rwlock_destroy") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_rwlock_t"))])
+    , ("pthread_rwlock_rdlock", FuncDescr (l "pthread_rwlock_rdlock") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_rwlock_t"))])
+    , ("pthread_rwlock_wrlock", FuncDescr (l "pthread_rwlock_wrlock") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_rwlock_t"))])
+    , ("pthread_rwlock_unlock", FuncDescr (l "pthread_rwlock_unlock") [] (BuiltinType S32Ty) [Pointer (ExternalType (fmap TIdName $ l "pthread_rwlock_t"))])
+    , ("PTHREAD_MUTEX_RECURSIVE", AliasDescr (l "PTHREAD_MUTEX_RECURSIVE") [] (BuiltinType S32Ty))
+    , ("__tokstyle_assume_true", FuncDescr (l "__tokstyle_assume_true") [] (BuiltinType VoidTy) [BuiltinType BoolTy])
+    , ("__tokstyle_assume_false", FuncDescr (l "__tokstyle_assume_false") [] (BuiltinType VoidTy) [BuiltinType BoolTy])
+    , ("__tokstyle_switch_cond", FuncDescr (l "__tokstyle_switch_cond") [] (BuiltinType S32Ty) [BuiltinType S32Ty])
+    ]

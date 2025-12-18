@@ -1,0 +1,297 @@
+load("@rules_haskell//haskell:defs.bzl", "haskell_library")
+load("//third_party/haskell/hspec-discover:build_defs.bzl", "hspec_test")
+load("//tools/project:build_defs.bzl", "project")
+
+project(
+    custom_cirrus = True,
+    license = "gpl3-https",
+)
+
+haskell_library(
+    name = "hic-core",
+    srcs = glob(["src/Language/Hic/Core/*.hs"]),
+    src_strip_prefix = "src",
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//hs-cimple",
+        "//third_party/haskell:QuickCheck",
+        "//third_party/haskell:aeson",
+        "//third_party/haskell:base",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:hashable",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:prettyprinter",
+        "//third_party/haskell:prettyprinter-ansi-terminal",
+        "//third_party/haskell:text",
+        "//third_party/haskell:transformers-compat",
+    ],
+)
+
+haskell_library(
+    name = "hic-typesystem-core",
+    srcs = glob([
+        "src/Language/Hic/TypeSystem/Core/*.hs",
+        "src/Language/Hic/TypeSystem/Core/Transition/*.hs",
+    ]),
+    src_strip_prefix = "src",
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":hic-core",
+        "//hs-cimple",
+        "//third_party/haskell:QuickCheck",
+        "//third_party/haskell:aeson",
+        "//third_party/haskell:base",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:hashable",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:prettyprinter",
+        "//third_party/haskell:prettyprinter-ansi-terminal",
+        "//third_party/haskell:text",
+        "//third_party/haskell:transformers-compat",
+    ],
+)
+
+haskell_library(
+    name = "hic-typesystem-standard",
+    srcs = glob(["src/Language/Hic/TypeSystem/Standard/*.hs"]),
+    src_strip_prefix = "src",
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":hic-core",
+        ":hic-typesystem-core",
+        "//hs-cimple",
+        "//third_party/haskell:base",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:prettyprinter",
+        "//third_party/haskell:prettyprinter-ansi-terminal",
+        "//third_party/haskell:text",
+    ],
+)
+
+haskell_library(
+    name = "hic-typesystem-ordered",
+    srcs = glob(["src/Language/Hic/TypeSystem/Ordered/*.hs"]),
+    src_strip_prefix = "src",
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":hic-core",
+        ":hic-typesystem-core",
+        "//hs-cimple",
+        "//third_party/haskell:aeson",
+        "//third_party/haskell:base",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:prettyprinter",
+        "//third_party/haskell:prettyprinter-ansi-terminal",
+        "//third_party/haskell:text",
+    ],
+)
+
+haskell_library(
+    name = "hic-ast-inference",
+    srcs = glob(["src/Language/Hic/Inference/**/*.hs"]) + [
+        "src/Language/Hic/Ast.hs",
+        "src/Language/Hic/Inference.hs",
+        "src/Language/Hic/Pretty.hs",
+    ],
+    src_strip_prefix = "src",
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":hic-core",
+        ":hic-typesystem-core",
+        "//hs-cimple",
+        "//third_party/haskell:aeson",
+        "//third_party/haskell:base",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:hashable",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:prettyprinter",
+        "//third_party/haskell:prettyprinter-ansi-terminal",
+        "//third_party/haskell:text",
+        "//third_party/haskell:transformers-compat",
+    ],
+)
+
+haskell_library(
+    name = "hic-refined",
+    srcs = glob([
+        "src/Language/Hic/Refined/**/*.hs",
+        "src/Language/Hic/Refined/*.hs",
+    ]),
+    src_strip_prefix = "src",
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":hic-ast-inference",
+        ":hic-core",
+        ":hic-typesystem-core",
+        "//hs-cimple",
+        "//third_party/haskell:aeson",
+        "//third_party/haskell:base",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:hashable",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:prettyprinter",
+        "//third_party/haskell:prettyprinter-ansi-terminal",
+        "//third_party/haskell:text",
+        "//third_party/haskell:transformers-compat",
+    ],
+)
+
+haskell_library(
+    name = "hs-hic",
+    srcs = ["src/Language/Hic.hs"],
+    src_strip_prefix = "src",
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    version = "0.0.0.1",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":hic-ast-inference",
+        ":hic-core",
+        ":hic-refined",
+        ":hic-typesystem-core",
+        ":hic-typesystem-ordered",
+        ":hic-typesystem-standard",
+        "//hs-cimple",
+        "//third_party/haskell:aeson",
+        "//third_party/haskell:base",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:text",
+        "//third_party/haskell:time",
+    ],
+)
+
+haskell_library(
+    name = "hic-test-utils",
+    srcs = ["test/Language/Hic/TestUtils.hs"],
+    src_strip_prefix = "test",
+    deps = [
+        "//hs-cimple",
+        "//third_party/haskell:base",
+        "//third_party/haskell:text",
+    ],
+)
+
+hspec_test(
+    name = "testsuite",
+    size = "medium",
+    deps = [
+        ":hic-ast-inference",
+        ":hic-core",
+        ":hic-refined",
+        ":hic-test-utils",
+        ":hic-typesystem-core",
+        ":hic-typesystem-ordered",
+        ":hic-typesystem-standard",
+        ":hs-hic",
+        "//hs-cimple",
+        "//third_party/haskell:QuickCheck",
+        "//third_party/haskell:base",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:groom",
+        "//third_party/haskell:hspec",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:prettyprinter",
+        "//third_party/haskell:prettyprinter-ansi-terminal",
+        "//third_party/haskell:text",
+    ],
+)
+
+hspec_test(
+    name = "test-typesystem-core",
+    size = "small",
+    srcs = glob(["test/Language/Hic/TypeSystem/Core/**/*.hs"]),
+    deps = [
+        ":hic-core",
+        ":hic-test-utils",
+        ":hic-typesystem-core",
+        "//hs-cimple",
+        "//third_party/haskell:QuickCheck",
+        "//third_party/haskell:base",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:hspec",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:text",
+    ],
+)
+
+hspec_test(
+    name = "test-typesystem-standard",
+    size = "medium",
+    srcs = glob(["test/Language/Hic/TypeSystem/Standard/*.hs"]),
+    deps = [
+        ":hic-core",
+        ":hic-test-utils",
+        ":hic-typesystem-core",
+        ":hic-typesystem-standard",
+        "//hs-cimple",
+        "//third_party/haskell:QuickCheck",
+        "//third_party/haskell:base",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:groom",
+        "//third_party/haskell:hspec",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:prettyprinter",
+        "//third_party/haskell:prettyprinter-ansi-terminal",
+        "//third_party/haskell:text",
+    ],
+)
+
+hspec_test(
+    name = "test-typesystem-ordered",
+    size = "small",
+    srcs = glob(["test/Language/Hic/TypeSystem/Ordered/*.hs"]),
+    deps = [
+        ":hic-core",
+        ":hic-test-utils",
+        ":hic-typesystem-core",
+        ":hic-typesystem-ordered",
+        "//hs-cimple",
+        "//third_party/haskell:QuickCheck",
+        "//third_party/haskell:base",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:data-fix",
+        "//third_party/haskell:groom",
+        "//third_party/haskell:hspec",
+        "//third_party/haskell:mtl",
+        "//third_party/haskell:prettyprinter",
+        "//third_party/haskell:prettyprinter-ansi-terminal",
+        "//third_party/haskell:text",
+    ],
+)
