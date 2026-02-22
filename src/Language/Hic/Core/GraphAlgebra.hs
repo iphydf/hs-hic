@@ -16,7 +16,9 @@ module Language.Hic.Core.GraphAlgebra
 import           Control.Monad.State.Strict (execState, modify)
 import           Data.IntMap.Strict         (IntMap)
 import qualified Data.IntMap.Strict         as IntMap
-import           Data.List                  (elemIndex, foldl')
+import           Data.IntSet                (IntSet)
+import qualified Data.IntSet                as IntSet
+import           Data.List                  (foldl')
 import           Data.Map.Strict            (Map)
 import qualified Data.Map.Strict            as Map
 import           Data.Maybe                 (fromMaybe)
@@ -99,14 +101,15 @@ minimize :: forall f. (Traversable f, Ord (f ()), Ord (f NodeId))
          -> [NodeId]          -- ^ Opaque terminal NodeIds (atomic)
          -> Graph f -> Graph f
 minimize structuredTerminals atomicTerminals (Graph nodes root) =
-    let terminals = atomicTerminals ++ IntMap.keys structuredTerminals
-        partition = findPartition structuredTerminals atomicTerminals nodes
-        realGroups = filter (not . any (`elem` terminals)) partition
+    let terminals = IntSet.fromList (atomicTerminals ++ IntMap.keys structuredTerminals)
+        (classMap, groupsByClass) = findPartition structuredTerminals atomicTerminals nodes
+        (lookupFinal, realGroups) = buildRemapping terminals classMap groupsByClass
 
         allNodes = nodes `IntMap.union` structuredTerminals
-        newNodes = IntMap.fromList [ (newIdx, fmap (findClassId terminals partition) (getNode allNodes i))
-                                   | (newIdx, i:_) <- zip [0..] realGroups ]
-        newRoot = findClassId terminals partition root
+        newNodes = IntMap.fromList
+            [ (newIdx, fmap lookupFinal (getNode allNodes (head group)))
+            | (newIdx, group) <- zip [0..] realGroups ]
+        newRoot = lookupFinal root
     in Graph newNodes newRoot
 
 -- | Merges two graphs into one, ensuring semantically identical nodes are shared.
@@ -115,23 +118,24 @@ merge :: forall f. (Traversable f, Ord (f ()), Ord (f NodeId))
       -> [NodeId]          -- ^ Opaque terminal NodeIds (atomic)
       -> Graph f -> Graph f -> (Graph f, NodeId, NodeId)
 merge structuredTerminals atomicTerminals g1 g2 =
-    let terminals = atomicTerminals ++ IntMap.keys structuredTerminals
+    let terminals = IntSet.fromList (atomicTerminals ++ IntMap.keys structuredTerminals)
         nodes1 = gNodes g1
         nodes2 = gNodes g2
         offset = (case IntMap.maxViewWithKey nodes1 of { Just ((k, _), _) -> k; Nothing -> 0 }) + 1
-        shift i | i `elem` terminals = i
-                | otherwise          = i + offset
+        shift i | IntSet.member i terminals = i
+                | otherwise                 = i + offset
         nodes2' = IntMap.fromList [ (shift k, fmap shift n) | (k, n) <- IntMap.toList nodes2 ]
 
         mergedNodes = IntMap.union nodes1 nodes2'
-        partition = findPartition structuredTerminals atomicTerminals mergedNodes
-        realGroups = filter (not . any (`elem` terminals)) partition
+        (classMap, groupsByClass) = findPartition structuredTerminals atomicTerminals mergedNodes
+        (lookupFinal, realGroups) = buildRemapping terminals classMap groupsByClass
 
         allNodes = mergedNodes `IntMap.union` structuredTerminals
-        newNodes = IntMap.fromList [ (newIdx, fmap (findClassId terminals partition) (getNode allNodes i))
-                                   | (newIdx, i:_) <- zip [0..] realGroups ]
-        newRoot1 = findClassId terminals partition (gRoot g1)
-        newRoot2 = findClassId terminals partition (shift (gRoot g2))
+        newNodes = IntMap.fromList
+            [ (newIdx, fmap lookupFinal (getNode allNodes (head group)))
+            | (newIdx, group) <- zip [0..] realGroups ]
+        newRoot1 = lookupFinal (gRoot g1)
+        newRoot2 = lookupFinal (shift (gRoot g2))
     in (Graph newNodes newRoot1, newRoot1, newRoot2)
 
 -- | Standard reachability pruning.
@@ -147,47 +151,90 @@ prune (Graph nodes root) =
 --------------------------------------------------------------------------------
 
 findPartition :: forall f. (Traversable f, Ord (f ()), Ord (f NodeId))
-              => IntMap (f NodeId) -> [NodeId] -> IntMap (f NodeId) -> [[NodeId]]
+              => IntMap (f NodeId) -> [NodeId] -> IntMap (f NodeId) -> (IntMap Int, Map Int [NodeId])
 findPartition structuredTerminals atomicTerminals nodes =
     let allNodes = nodes `IntMap.union` structuredTerminals
-        terminals = atomicTerminals ++ IntMap.keys structuredTerminals
+        terminals = IntSet.fromList (atomicTerminals ++ IntMap.keys structuredTerminals)
         initialPartition = [ [t] | t <- atomicTerminals ] ++
             (Map.elems $ Map.fromListWith (++) $
                 [ (fmap (const ()) node, [i]) | (i, node) <- IntMap.toList allNodes ])
-    in refine allNodes terminals initialPartition
+        (classMap0, groups0) = buildClassMapAndGroups terminals initialPartition
+    in refine allNodes terminals classMap0 groups0
 
 refine :: forall f. (Traversable f, Ord (f NodeId))
-       => IntMap (f NodeId) -> [NodeId] -> [[NodeId]] -> [[NodeId]]
-refine allNodes terminals p =
-    let msg = "GA.refine: partition_size=" ++ show (length p)
+       => IntMap (f NodeId) -> IntSet -> IntMap Int -> Map Int [NodeId] -> (IntMap Int, Map Int [NodeId])
+refine allNodes terminals classMap groupsByClass =
+    let numGroups = Map.size groupsByClass
+        msg = "GA.refine: partition_size=" ++ show numGroups
     in dtrace msg $
-    let p' = concatMap (split allNodes terminals p) p
-    in if length p' == length p then p else refine allNodes terminals p'
+    let groups = Map.elems groupsByClass
+        newGroups = concatMap (split allNodes terminals classMap) groups
+    in if length newGroups == numGroups
+       then (classMap, groupsByClass)
+       else let (classMap', groups') = buildClassMapAndGroups terminals newGroups
+            in refine allNodes terminals classMap' groups'
 
 split :: forall f. (Traversable f, Ord (f NodeId))
-      => IntMap (f NodeId) -> [NodeId] -> [[NodeId]] -> [NodeId] -> [[NodeId]]
-split allNodes terminals p currentGroup =
+      => IntMap (f NodeId) -> IntSet -> IntMap Int -> [NodeId] -> [[NodeId]]
+split allNodes terminals classMap currentGroup =
     -- Opaque terminal nodes are atomic and never split.
     -- Structured terminals CAN be merged with regular nodes if they stay bisimilar.
-    if any (`elem` terminals) currentGroup && all (`elem` terminals) currentGroup
+    if any (`IntSet.member` terminals) currentGroup && all (`IntSet.member` terminals) currentGroup
     then [currentGroup]
-    else Map.elems $ Map.fromListWith (++) [ (fmap (findClassId terminals p) (getNode allNodes i), [i]) | i <- currentGroup ]
+    else Map.elems $ Map.fromListWith (++) [ (fmap (lookupClass terminals classMap) (getNode allNodes i), [i]) | i <- currentGroup ]
 
 getNode :: IntMap (f NodeId) -> NodeId -> f NodeId
 getNode nodes i = fromMaybe (error $ "GraphAlgebra: missing node " ++ show i) $ IntMap.lookup i nodes
 
-findClassId :: [NodeId] -> [[NodeId]] -> NodeId -> Int
-findClassId terminals p i
-    | i `elem` terminals = i
-    | otherwise =
-        case elemIndex True (map (elem i) p) of
-            Just idx ->
-                let group = p !! idx
-                in case filter (`elem` terminals) group of
+lookupClass :: IntSet -> IntMap Int -> NodeId -> Int
+lookupClass terminals classMap i
+    | IntSet.member i terminals = i
+    | otherwise = IntMap.findWithDefault i i classMap
+
+buildClassMap :: IntSet -> [[NodeId]] -> IntMap Int
+buildClassMap terminals groups = IntMap.fromList
+    [ (i, classId)
+    | group <- groups
+    , let classId = case filter (`IntSet.member` terminals) group of
+            (t:_) -> t
+            []    -> head group
+    , i <- group
+    ]
+
+-- | Build both classMap and groupsByClass in a single pass from groups.
+buildClassMapAndGroups :: IntSet -> [[NodeId]] -> (IntMap Int, Map Int [NodeId])
+buildClassMapAndGroups terminals groups =
+    let classMap = IntMap.fromList
+            [ (i, classId)
+            | group <- groups
+            , let classId = case filter (`IntSet.member` terminals) group of
                     (t:_) -> t
-                    []    -> fromMaybe (error "GraphAlgebra: internal failure in findClassId") $
-                             elemIndex idx [ j | (j, g) <- zip [0..] p, not (any (`elem` terminals) g) ]
-            Nothing -> i
+                    []    -> head group
+            , i <- group
+            ]
+        groupsByClass = Map.fromListWith (++) [ (c, [i]) | (i, c) <- IntMap.toList classMap ]
+    in (classMap, groupsByClass)
+
+-- | Build a remapping from old NodeIds to new sequential IDs.
+-- Terminal nodes keep their IDs. Non-terminal nodes in groups
+-- containing a terminal map to that terminal's ID. Other nodes
+-- get sequential IDs (0, 1, 2, ...).
+buildRemapping :: IntSet -> IntMap Int -> Map Int [NodeId] -> (NodeId -> NodeId, [[NodeId]])
+buildRemapping terminals _classMap groupsByClass =
+    let realGroups = [ group | group <- Map.elems groupsByClass
+                     , not (any (`IntSet.member` terminals) group) ]
+        finalMap = IntMap.fromList $
+            [ (i, newIdx) | (newIdx, group) <- zip [0..] realGroups, i <- group ] ++
+            [ (i, t) | group <- Map.elems groupsByClass
+                      , let ts = filter (`IntSet.member` terminals) group
+                      , not (null ts)
+                      , let t = head ts
+                      , i <- group
+                      , not (IntSet.member i terminals) ]
+        lookupFinal i
+            | IntSet.member i terminals = i
+            | otherwise = IntMap.findWithDefault i i finalMap
+    in (lookupFinal, realGroups)
 
 getChildren :: forall f. (Traversable f) => IntMap (f NodeId) -> NodeId -> [NodeId]
 getChildren nodes i

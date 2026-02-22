@@ -313,11 +313,12 @@ stepValueStructure ps@ProductState{..} lookupNode getQuals terminals cL cR sL sR
                            then Just (VArray resM resDs, identL, identR)
                            else Nothing
 
-            -- nullptr_t vs Pointer/Array (Decay)
+            -- nullptr_t vs Pointer/Array
             (vL, VPointer tR nullR oR) | isNull vL ->
                 let (resState, _) = getTargetState ps terminals getQuals cL cR bot tR
                 in case psPolarity of
-                    PJoin -> Just (VPointer (bot, tR, resState) QNullable' oR, False, True)
+                    -- NullPtrTy <= Pointer (when not Nonnull), so join uses max with QUnspecified
+                    PJoin -> Just (VPointer (bot, tR, resState) (max QUnspecified nullR) oR, False, True)
                     PMeet -> if allowCovariance psQualR && nullR /= QNonnull'
                              then Just (fmap (\x -> (x, x, ps)) vL, True, False)
                              else Nothing
@@ -325,25 +326,31 @@ stepValueStructure ps@ProductState{..} lookupNode getQuals terminals cL cR sL sR
             (VPointer tL nullL oL, vR) | isNull vR ->
                 let (resState, _) = getTargetState ps terminals getQuals cL cR tL bot
                 in case psPolarity of
-                    PJoin -> Just (VPointer (tL, bot, resState) QNullable' oL, True, False)
+                    PJoin -> Just (VPointer (tL, bot, resState) (max nullL QUnspecified) oL, True, False)
                     PMeet -> if allowCovariance psQualL && nullL /= QNonnull'
                              then Just (fmap (\x -> (x, x, ps)) vR, False, True)
                              else Nothing
 
-            (vL, VArray mR _) | isNull vL ->
+            (vL, VArray mR dsR) | isNull vL ->
                 let tR = fromMaybe bot mR
                     (resState, _) = getTargetState ps terminals getQuals cL cR bot tR
+                    dimState = resState { psQualL = QualTop, psQualR = QualTop }
                 in case psPolarity of
-                    PJoin -> Just (VPointer (bot, tR, resState) QNullable' QNonOwned', False, False)
+                    -- NullPtrTy <= Array, so join returns the Array side
+                    PJoin -> Just (VArray (fmap (\t -> (bot, t, resState)) mR)
+                                         (map (\d -> (bot, d, dimState)) dsR), False, True)
                     PMeet -> if allowCovariance psQualR
                              then Just (fmap (\x -> (x, x, ps)) vL, True, False)
                              else Nothing
 
-            (VArray mL _, vR) | isNull vR ->
+            (VArray mL dsL, vR) | isNull vR ->
                 let tL = fromMaybe bot mL
                     (resState, _) = getTargetState ps terminals getQuals cL cR tL bot
+                    dimState = resState { psQualL = QualTop, psQualR = QualTop }
                 in case psPolarity of
-                    PJoin -> Just (VPointer (tL, bot, resState) QNullable' QNonOwned', False, False)
+                    -- NullPtrTy <= Array, so join returns the Array side
+                    PJoin -> Just (VArray (fmap (\t -> (t, bot, resState)) mL)
+                                         (map (\d -> (d, bot, dimState)) dsL), True, False)
                     PMeet -> if allowCovariance psQualL
                              then Just (fmap (\x -> (x, x, ps)) vR, False, True)
                              else Nothing

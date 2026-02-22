@@ -5,7 +5,8 @@
 module Main (main) where
 
 import qualified Control.Exception                                    as E
-import           Control.Monad                                        (when)
+import           Control.Monad                                        (foldM,
+                                                                       when)
 import           Data.Aeson                                           (encode)
 import qualified Data.ByteString                                      as B
 import qualified Data.ByteString.Lazy                                 as BL
@@ -35,6 +36,7 @@ import qualified Language.Cimple.Program                              as Program
 import           Language.Hic                                         (HicState (..),
                                                                        Phase (..),
                                                                        emptyState,
+                                                                       executePhase,
                                                                        runToPhase)
 import           Language.Hic.Ast                                     (HicNode (..),
                                                                        Node,
@@ -79,11 +81,23 @@ import qualified Prettyprinter.Render.Text                            as TextRen
 import           System.Exit                                          (ExitCode (..),
                                                                        exitFailure,
                                                                        exitSuccess)
-import           System.IO                                            (hIsTerminalDevice,
+import           System.IO                                            (hFlush,
+                                                                       hIsTerminalDevice,
                                                                        stdout)
 import           System.Process                                       (callProcess)
 import           Text.Groom                                           (groom)
 import           Text.Printf                                          (printf)
+
+runTimed :: String -> IO a -> IO a
+runTimed name action = do
+    putStr $ "Phase: " ++ name ++ "..."
+    hFlush stdout
+    start <- getCurrentTime
+    res <- action
+    end <- getCurrentTime
+    let duration = realToFrac (diffUTCTime end start) :: Double
+    printf " (%.3fs)\n" duration
+    return res
 
 parsePhase :: String -> Either String Phase
 parsePhase s =
@@ -114,7 +128,7 @@ parseSolver :: String -> Either String SolverType
 parseSolver s =
     case find (\(p) -> solverName p == s) [minBound .. maxBound] of
         Just p  -> Right p
-        Nothing -> Left $ "Unknown solver: " ++ s
+        Nothing -> Left $ "Unknown solver: " ++ s ++ " (available: " ++ intercalate ", " (map solverName [minBound .. maxBound]) ++ ")"
 
 data Options = Options
     { optInputs     :: [FilePath]
@@ -195,7 +209,7 @@ main = do
 
     E.handle handler $ E.finally (do
         opts <- execParser (info (options <**> helper) fullDesc)
-        result <- CIO.parseProgram (optInputs opts)
+        result <- runTimed "Parsing" $ CIO.parseProgram (optInputs opts)
         case result of
             Left err -> do
                 putStrLn $ "Parse error: " ++ err
@@ -204,7 +218,18 @@ main = do
                 let program = filterProgram opts program'
                 let targetPhase = fromMaybe maxBound (optStopAfter opts)
 
-                hicState <- runToPhase putStrLn targetPhase (emptyState program)
+                let runPhaseLogger msg = do
+                        putStr msg
+                        hFlush stdout
+                
+                let phasesToRun = case optStopAfter opts of
+                        Just p  -> [minBound .. p]
+                        Nothing -> case optSolver opts of
+                            SolverOrdered -> [minBound .. maxBound]
+                            SolverSimple  -> []
+                            SolverRefined -> [PhaseGlobalStructural]
+                            
+                hicState <- foldM (executePhase runPhaseLogger) (emptyState program) phasesToRun
 
                 let dump p res = case optDumpJson opts of
                         Just base -> do
@@ -220,10 +245,10 @@ main = do
                 dump PhaseConstraintGen (hsConstraintGen hicState)
                 dump PhaseSolving (hsOrderedResult hicState)
 
-                let errors = case optSolver opts of
-                        SolverOrdered -> maybe [] osrErrors (hsOrderedResult hicState)
-                        SolverSimple  -> map snd (typeCheckProgram program)
-                        _ -> []
+                errors <- case optSolver opts of
+                    SolverOrdered -> return $ maybe [] osrErrors (hsOrderedResult hicState)
+                    SolverSimple  -> runTimed "Standard Type Checking" $ E.evaluate $ map snd (typeCheckProgram program)
+                    _ -> return []
 
                 let extractPath ei = case find isFile (errContext ei) of
                         Just (InFile p) -> p
@@ -257,20 +282,19 @@ main = do
                             putStrLn $ "... and " ++ show (length errors - optMaxErrors opts) ++ " more errors elided."
 
                 -- Hic Inference
-                let hicProgram = fromCimple program
+                hicProgram <- runTimed "Global Inference" $ E.evaluate $ fromCimple program
                 when (targetPhase >= PhaseSolving) $ do
-                    putStrLn "Global Inference..."
                     let stats = collectStats hicProgram
 
                     if optExemplars opts
                         then showExemplars (optColor opts) hicProgram
                         else do
-                            putStrLn "Comparing round-tripped ASTs..."
-                            let loweredProgram = toCimple hicProgram
-                            let originalList = Program.toList program
-                            let loweredMap = Map.fromList $ Program.toList loweredProgram
+                            runTimed "AST Round-tripping" $ do
+                                let loweredProgram = toCimple hicProgram
+                                let originalList = Program.toList program
+                                let loweredMap = Map.fromList $ Program.toList loweredProgram
 
-                            mapM_ (checkFile loweredMap) originalList
+                                mapM_ (checkFile loweredMap) originalList
 
                             putStrLn "\nDiagnostics:"
                             if null (progDiagnostics hicProgram)

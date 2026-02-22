@@ -51,7 +51,6 @@ module Language.Hic.TypeSystem.Core.Base
     , stripAllWrappers
     , isPointerLike
     , getInnerType
-    , promoteNonnull
     , lookupMemberType
     , descrToTypeInfo
     , isVarArg
@@ -854,11 +853,6 @@ getInnerType t = case unwrap t of
     Pointer inner        -> inner
     Array (Just inner) _ -> inner
     _                    -> t
-
-promoteNonnull :: TypeInfo p -> TypeInfo p
-promoteNonnull = foldFix $ \case
-    QualifiedF qs t -> Qualified (Set.insert QNonnull (Set.delete QNullable qs)) t
-    f           -> Fix f
 
 descrToTypeInfo :: TypeDescr p -> TypeInfo p
 descrToTypeInfo = \case

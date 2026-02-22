@@ -46,7 +46,7 @@ solveAll graph starts =
   where
     getDeps k = case Map.lookup k graph of
         Nothing  -> []
-        Just gs -> TS.collectUniqueTemplateVars (map TG.toTypeInfo (Set.toList gs))
+        Just gs -> concatMap TG.collectTemplateVarsFromGraph (Set.toList gs)
 
     collectReachable seen [] = seen
     collectReachable seen (k:ks)
@@ -58,10 +58,11 @@ solveAll graph starts =
     resolveScc acc (Graph.CyclicSCC ks) = resolveCyclicScc acc ks
 
     substituteAll acc g =
-        let vars = TS.collectUniqueTemplateVars [TG.toTypeInfo g]
-        in foldl (\accG v -> case Map.lookup v acc of
-                                Just vG -> minimizeGraph $ TG.substitute v vG accG
-                                Nothing -> accG) g vars
+        let vars = TG.collectTemplateVarsFromGraph g
+            substituted = foldl (\accG v -> case Map.lookup v acc of
+                                    Just vG -> TG.substitute v vG accG
+                                    Nothing -> accG) g vars
+        in minimizeGraph substituted
 
     resolveAcyclicScc acc k =
         case Map.lookup k graph of
@@ -76,19 +77,19 @@ solveAll graph starts =
         let isInternal ft = ftId ft `elem` map ftId ks
 
             -- In the domain of equi-recursive types, LFP is handled by TG.lfp.
-            lfp' v g = minimizeGraph $ TG.lfp v g
+            lfp' v g = TG.lfp v g
 
             -- Substitution replaces a template with its solved expression.
-            subst' v vG targetG = minimizeGraph $ TG.substitute v vG targetG
+            subst' v vG targetG = TG.substitute v vG targetG
 
-            join' g1 g2 = minimizeGraph $ joinGraph isInternal g1 g2
+            join' g1 g2 = joinGraph isInternal g1 g2
 
             -- Initial equations for the SCC: substitute everything from outside the SCC.
             eqns = Map.fromList [ (k, Set.map (substituteAll acc) (fromMaybe Set.empty (Map.lookup k graph))) | k <- ks ]
             bottom = TG.fromTypeInfo TS.Unconstrained
 
             -- Solve the system of equations using variable elimination.
-            resultMap = solveSCC subst' lfp' join' bottom eqns
+            resultMap = Map.map minimizeGraph $ solveSCC subst' lfp' join' bottom eqns
         in Map.union resultMap acc
 
 

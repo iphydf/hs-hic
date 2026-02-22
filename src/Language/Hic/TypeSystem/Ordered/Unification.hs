@@ -8,6 +8,7 @@ module Language.Hic.TypeSystem.Ordered.Unification
     , UnifyState (..)
     , Unify
     , runUnification
+    , buildBindingsIndex
     , unify
     , subtype
     , applyBindings
@@ -90,7 +91,6 @@ import           Language.Hic.TypeSystem.Core.Base          (isLPSTR,
                                                              isPointerLike,
                                                              isPointerToChar,
                                                              isVarArg,
-                                                             promoteNonnull,
                                                              unwrap)
 import qualified Language.Hic.TypeSystem.Core.Base          as TS
 import qualified Language.Hic.TypeSystem.Core.GraphSolver   as GS
@@ -113,21 +113,25 @@ data UnifyResult = UnifyResult
     } deriving (Show)
 
 data UnifyState = UnifyState
-    { usBindings   :: Map (FullTemplate 'Local) (TypeInfo 'Local, Provenance 'Local)
-    , usErrors     :: [ErrorInfo 'Local]
-    , usTypeSystem :: TypeSystem
-    , usSeen       :: Set (TypeInfo 'Local, TypeInfo 'Local, QualState)
-    , usNextId     :: Int
-    , usFinalPass  :: Bool
+    { usBindings      :: Map (FullTemplate 'Local) (TypeInfo 'Local, Provenance 'Local)
+    , usBindingsIndex :: Map (TemplateId 'Local) [FullTemplate 'Local]
+    , usErrors        :: [ErrorInfo 'Local]
+    , usTypeSystem    :: TypeSystem
+    , usSeen          :: Set (TypeInfo 'Local, TypeInfo 'Local, QualState)
+    , usNextId        :: Int
+    , usFinalPass     :: Bool
     }
 
 type Unify = State UnifyState
 
 runUnification :: TypeSystem -> Unify a -> UnifyResult
 runUnification ts action =
-    let initialState = UnifyState Map.empty [] ts Set.empty 0 True
+    let initialState = UnifyState Map.empty Map.empty [] ts Set.empty 0 True
         finalState = execState action initialState
     in UnifyResult (usErrors finalState) (usBindings finalState)
+
+buildBindingsIndex :: Map (FullTemplate 'Local) a -> Map (TemplateId 'Local) [FullTemplate 'Local]
+buildBindingsIndex = Map.foldlWithKey' (\acc ft _ -> Map.insertWith (++) (ftId ft) [ft] acc) Map.empty
 
 unify :: TypeInfo 'Local -> TypeInfo 'Local -> MismatchReason -> Maybe (Lexeme Text) -> [Context 'Local] -> Unify (Maybe (MismatchDetail 'Local))
 unify = unifyRecursive QualTop
@@ -164,7 +168,11 @@ deVoidify = foldFixM alg
   where
     alg (PointerF it) | TS.isVoid it = do
         tid <- nextSolverTemplate Nothing
-        return $ Pointer (applyWrappers it tid)
+        -- Hoist wrappers (Nullable, Nonnull, etc.) outside the Pointer so
+        -- that e.g. void *_Nullable becomes Nullable(Pointer(Template T))
+        -- rather than Pointer(Nullable(Template T)).  The annotation
+        -- qualifies the pointer, not the pointee.
+        return $ applyWrappers it (Pointer tid)
     alg f = return $ Fix f
 
     applyWrappers (BuiltinType VoidTy) x = x
@@ -200,9 +208,13 @@ subtypeImpl qstate actual expected reason ml ctx = do
         (BuiltinType NullPtrTy, Nullable _) -> return Nothing
         (BuiltinType NullPtrTy, Pointer _) -> return Nothing
         (BuiltinType NullPtrTy, Owner _) -> return Nothing
+        (BuiltinType NullPtrTy, Array _ _) -> return Nothing
+        (BuiltinType NullPtrTy, Sized _ _) -> return Nothing
         (Nullable _, BuiltinType NullPtrTy) -> return Nothing
         (Pointer _, BuiltinType NullPtrTy) -> return Nothing
         (Owner _, BuiltinType NullPtrTy) -> return Nothing
+        (Array _ _, BuiltinType NullPtrTy) -> return Nothing
+        (Sized _ _, BuiltinType NullPtrTy) -> return Nothing
 
         (BuiltinType VoidTy, a) -> do
             let tid = TIdAnonymous 0 (Just "") -- Default hint for anonymous void*
@@ -213,6 +225,12 @@ subtypeImpl qstate actual expected reason ml ctx = do
 
         (Template t i, a) -> bind t i a reason ml ctx' >> return Nothing
         (a, Template t i) -> bind t i a reason ml ctx' >> return Nothing
+
+        -- Sized is metadata (length tracking from joinSizer), strip it before
+        -- qualifier checks so that Nullable/Nonnull match correctly on both sides.
+        (Sized a _, Sized e _)   -> subtypeRecursive qstate a e reason ml ctx'
+        (Sized a _, e)           -> subtypeRecursive qstate a e reason ml ctx'
+        (a, Sized e _)           -> subtypeRecursive qstate a e reason ml ctx'
 
         (Qualified qs a, Qualified es e) -> do
             let errNonnull = if Set.member QNonnull es && not (Set.member QNonnull qs)
@@ -234,7 +252,14 @@ subtypeImpl qstate actual expected reason ml ctx = do
                 []      -> subtypeRecursive qstate a e reason ml ctx'
 
         (Qualified qs a, e) -> do
-            let errNullable = if Set.member QNullable qs
+            -- Allow nullable actual when:
+            -- (1) The expected type is an Array — nullable pointers can be
+            --     indexed (programmer is responsible for null-checking).
+            -- (2) The constraint comes from a cast — explicit casts should be
+            --     able to strip nullable (e.g. casting a deVoidified void*
+            --     _Nullable return value to a concrete pointer type).
+            let isArr = case e of { Array _ _ -> True; _ -> False }
+            let errNullable = if Set.member QNullable qs && not isArr && reason /= CastMismatch
                               then Just (BaseMismatch expected actual)
                               else Nothing
             let errConst = if Set.member QConst qs && qstate /= QualTop
@@ -248,10 +273,8 @@ subtypeImpl qstate actual expected reason ml ctx = do
             let check q = case q of
                     QNonnull -> if Set.member QNonnull es
                                 then case a of
+                                    _ | isPointerLike a -> Nothing
                                     Function {} -> Nothing
-                                    Array {} -> Nothing
-                                    Pointer (Function {}) -> Nothing
-                                    Pointer (Array {}) -> Nothing
                                     _ -> Just (MissingQualifier QNonnull expected actual)
                                 else Nothing
                     QConst -> if Set.member QConst es && not (allowCovariance qstate)
@@ -264,10 +287,6 @@ subtypeImpl qstate actual expected reason ml ctx = do
             case catMaybes [check QNonnull, check QConst, check QOwner] of
                 (err:_) -> reportMismatch err
                 []      -> subtypeRecursive qstate a e reason ml ctx'
-
-        (Sized a _, Sized e _)   -> subtypeRecursive qstate a e reason ml ctx'
-        (Sized a _, e)           -> subtypeRecursive qstate a e reason ml ctx'
-        (_, Sized _ _)           -> reportMismatch (BaseMismatch expected actual)
 
         (Pointer _, Pointer _) -> fmap (wrap InPointer) <$> subtypePtr qstate actual expected reason ml ctx'
         (Array (Just _) _, Pointer _) -> fmap (wrap InPointer) <$> subtypePtr qstate actual expected reason ml ctx'
@@ -396,6 +415,10 @@ compatible (BuiltinType NullPtrTy) (Pointer _) = True
 compatible (Pointer _) (BuiltinType NullPtrTy) = True
 compatible (BuiltinType NullPtrTy) (Nullable _) = True
 compatible (Nullable _) (BuiltinType NullPtrTy) = True
+compatible (BuiltinType NullPtrTy) (Array _ _) = True
+compatible (Array _ _) (BuiltinType NullPtrTy) = True
+compatible (BuiltinType NullPtrTy) (Sized _ _) = True
+compatible (Sized _ _) (BuiltinType NullPtrTy) = True
 compatible (Template _ _) _ = True
 compatible _ (Template _ _) = True
 compatible (Pointer _) (Array _ _) = True
@@ -427,18 +450,21 @@ bind tid index ty reason ml ctx = do
     rep <- applyBindings (Template tid index)
     case rep of
         Template tid' index' -> do
-            bindings <- State.gets usBindings
+            s <- State.get
+            let bindings = usBindings s
             let k = FullTemplate tid' index'
 
-            -- Conflict check across exact/compatible matches.
-            forM_ (Map.toList bindings) $ \case
-                (FullTemplate tid'' index'', (existing, _)) | tid'' == tid' ->
-                    case (index', index'') of
-                        (Nothing, Nothing) -> void $ unify existing ty reason ml ctx
-                        (Just idx, Just idx')
-                            | compatible idx idx' || compatible idx' idx -> void $ unify existing ty reason ml ctx
-                        _ -> return ()
-                _ -> return ()
+            -- Conflict check across exact/compatible matches using secondary index.
+            let related = Map.findWithDefault [] tid' (usBindingsIndex s)
+            forM_ related $ \ft@(FullTemplate _ index'') ->
+                case Map.lookup ft bindings of
+                    Just (existing, _) ->
+                        case (index', index'') of
+                            (Nothing, Nothing) -> void $ unify existing ty reason ml ctx
+                            (Just idx, Just idx')
+                                | compatible idx idx' || compatible idx' idx -> void $ unify existing ty reason ml ctx
+                            _ -> return ()
+                    Nothing -> return ()
 
             -- Add the binding if not already exactly present
             case Map.lookup k bindings of
@@ -449,12 +475,14 @@ bind tid index ty reason ml ctx = do
                         _ | occurs tid' index' ty -> do
                             let prov = FromContext (ErrorInfo ml ctx (TypeMismatch (Template tid' index') ty reason Nothing) [])
                             dtraceM $ "  BIND (Occurs): " ++ show (Template tid' index') ++ " -> " ++ show ty
-                            State.modify $ \s -> s { usBindings = Map.insert k (ty, prov) (usBindings s) }
+                            State.modify $ \s' -> s' { usBindings = Map.insert k (ty, prov) (usBindings s')
+                                                     , usBindingsIndex = Map.insertWith (++) tid' [k] (usBindingsIndex s') }
                         Unsupported _ -> return ()
                         _ -> do
                             let prov = FromContext (ErrorInfo ml ctx (TypeMismatch (Template tid' index') ty reason Nothing) [])
                             dtraceM $ "  BIND: " ++ show (Template tid' index') ++ " -> " ++ show ty
-                            State.modify $ \s -> s { usBindings = Map.insert k (ty, prov) (usBindings s) }
+                            State.modify $ \s' -> s' { usBindings = Map.insert k (ty, prov) (usBindings s')
+                                                     , usBindingsIndex = Map.insertWith (++) tid' [k] (usBindingsIndex s') }
         _ -> void $ unify rep ty reason ml ctx
 
 

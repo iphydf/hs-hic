@@ -59,6 +59,7 @@ data MismatchReason
     | ArgumentMismatch Int -- Index
     | AssignmentMismatch
     | InitializerMismatch
+    | CastMismatch
     deriving (Show, Eq, Ord, Generic)
 
 instance Arbitrary MismatchReason where
@@ -68,6 +69,7 @@ instance Arbitrary MismatchReason where
         , ArgumentMismatch <$> arbitrary
         , return AssignmentMismatch
         , return InitializerMismatch
+        , return CastMismatch
         ]
 
 instance ToJSON MismatchReason

@@ -198,13 +198,17 @@ Hic:
 -   Overwriting the active member of a union with a different variant.
 -   Once a union is refined, its variant identity is fixed for its lifetime.
 
-### D. Raw Pointers as Arrays
+### D. Pointer Arithmetic and Array Degradation
 
--   Using pointer arithmetic (e.g., `p++`, `p + 5`) on a type declared as a raw
-    pointer `T *`.
--   Indexing into a pointer that was not declared as an array `T[]`.
--   Hic strictly separates **References** (point to 1 element) from
-    **Collections** (point to $N$ elements).
+-   Pointer arithmetic (e.g., `p++`, `p + 5`) on arrays **degrades** the array
+    to a plain pointer, preserving the element type, nullability, ownership, and
+    qualifiers.
+-   Adding two pointers (e.g., `p1 + p2`) is forbidden, as it is invalid C.
+-   Indexing into a pointer that was not declared as an array `T[]` is not
+    supported.
+-   Hic distinguishes **References** (point to 1 element) from **Collections**
+    (point to $N$ elements), but permits controlled degradation when arithmetic
+    is applied.
 
 ### E. Manual Memory Layout Assumptions
 
@@ -230,15 +234,14 @@ Hic:
     **Single Nominal Truth**. The `restrict` hint for optimization is ignored by
     the safety engine.
 
-### H. Unsupported Pointer Difference Type (ptrdiff_t)
+### H. Pointer Difference Type (ptrdiff_t)
 
--   The `ptrdiff_t` type and the operation of pointer subtraction (e.g., `p1 -
-    p2`) are not supported.
--   Because Hic treats **References** as points to individual objects rather
-    than memory addresses, the concept of a numeric "distance" between pointers
-    is semantically invalid.
--   Relative indexing is only permitted within an **Array** context via integer
-    indices.
+-   Pointer subtraction (e.g., `p1 - p2`) produces a signed 64-bit integer
+    (`int64_t`), representing the distance between two pointers.
+-   Subtracting a non-pointer from a pointer (e.g., `p - n`) degrades the
+    pointer to a plain pointer, preserving element type and qualifiers.
+-   Subtracting a pointer from a non-pointer (e.g., `n - p`) is forbidden, as
+    it is invalid C.
 
 --------------------------------------------------------------------------------
 

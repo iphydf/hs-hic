@@ -515,9 +515,9 @@ spec = do
     it "disallows member access on a non-struct" $ do
         prog <- mustParse ["void f(void *p) { ((int)p).x = 1; }"]
         osrErrors (runFullAnalysis prog) `errorsShouldMatch`
-            [ "test.c:1: type mismatch: expected int32_t, got T0*"
+            [ "test.c:1: cast type mismatch: expected int32_t, got T0*"
             , "  expected int32_t, but got T0*"
-            , "  while unifying int32_t and T0* (general mismatch)"
+            , "  while unifying int32_t and T0* (cast)"
             , ""
             , "  where template T0 was bound to p due to type mismatch: expected T0, got p"
             , "        template p is unbound"
@@ -1591,10 +1591,10 @@ spec = do
                 , "}"
                 ]
             prog `shouldHaveErrors`
-                [ "test.c:5: type mismatch: expected struct My_B, got struct My_A"
+                [ "test.c:5: cast type mismatch: expected struct My_B, got struct My_A"
                 , "  expected struct My_B, but got struct My_A"
-                , "  while unifying struct My_B and struct My_A (general mismatch)"
-                , "  while unifying struct My_B* and T0* (general mismatch)"
+                , "  while unifying struct My_B and struct My_A (cast)"
+                , "  while unifying struct My_B* and T0* (cast)"
                 , ""
                 , "  where template T0 was bound to struct My_A due to type mismatch: expected T0, got p"
                 ]
@@ -1778,5 +1778,77 @@ spec = do
             , ""
             , "  where template T13(userdata) indexed by int32_t=0"
             ]
+
+    describe "False positive regressions" $ do
+        it "allows nullptr assignment to nullable pointer" $ do
+            prog <- mustParse
+                [ "void f(int *_Nullable items, int n) {"
+                , "    items = nullptr;"
+                , "}"
+                ]
+            shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog
+
+        it "allows nullptr assignment to Sized nullable pointer (member access only)" $ do
+            prog <- mustParse
+                [ "struct My_Struct { int *_Nullable items; int num_items; };"
+                , "void f(struct My_Struct *s) {"
+                , "    s->items = nullptr;"
+                , "}"
+                ]
+            shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog
+
+        it "allows nullptr assignment to Sized nullable pointer" $ do
+            prog <- mustParse
+                [ "struct My_Struct { int *_Nullable items; int num_items; };"
+                , "void f(struct My_Struct *s) {"
+                , "    s->items[0] = 1;"
+                , "    s->items = nullptr;"
+                , "}"
+                ]
+            shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog
+
+        it "allows struct pointer argument to void* nullable parameter" $ do
+            prog <- mustParse
+                [ "void mem_delete(void *_Nullable ptr);"
+                , "struct My_S { int x; };"
+                , "void f(struct My_S *_Nullable s) {"
+                , "    mem_delete(s);"
+                , "}"
+                ]
+            shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog
+
+        it "handles realloc pattern with void* and cast" $ do
+            prog <- mustParse
+                [ "void *_Nullable mem_vrealloc(void *_Nullable ptr, int n, int sz);"
+                , "struct My_S { int x; };"
+                , "void f(struct My_S *_Nullable items) {"
+                , "    struct My_S *new_items = (struct My_S *)mem_vrealloc(items, 10, sizeof(struct My_S));"
+                , "}"
+                ]
+            shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog
+
+        it "handles realloc pattern assigning back to Sized member" $ do
+            prog <- mustParse
+                [ "void *_Nullable mem_vrealloc(void *_Nullable ptr, uint32_t n, uint32_t sz);"
+                , "struct My_Item { void *_Nullable data; int x; };"
+                , "struct My_Container { struct My_Item *_Nullable items; uint32_t items_length; };"
+                , "void f(struct My_Container *c, uint32_t num) {"
+                , "    c->items[0].x = 1;"
+                , "    struct My_Item *new_items = (struct My_Item *)mem_vrealloc(c->items, num, sizeof(struct My_Item));"
+                , "    if (new_items == nullptr) { return; }"
+                , "    c->items = new_items;"
+                , "}"
+                ]
+            shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog
+
+        it "does not propagate nonnull to scalar through array access" $ do
+            prog <- mustParse
+                [ "void f(const int *_Nullable data) {"
+                , "    if (data != nullptr) {"
+                , "        int x = data[0] != 0;"
+                , "    }"
+                , "}"
+                ]
+            shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog
 
 -- end of tests

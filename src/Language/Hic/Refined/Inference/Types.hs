@@ -18,6 +18,7 @@ module Language.Hic.Refined.Inference.Types
     , addVar
     , addTaggedUnion
     , isNumeric
+    , isReference
     ) where
 
 import           Data.Aeson                           (ToJSON (..), object,
@@ -99,6 +100,11 @@ isNumeric = \case
                             , "off_t", "bool"
                             ]
             _ -> False
+    _ -> False
+
+isReference :: Maybe (AnyRigidNodeF TemplateId Word32) -> Bool
+isReference = \case
+    Just (AnyRigidNodeF (RReference _ _ _ _)) -> True
     _ -> False
 
 addConstraintCoerced :: Maybe (Lexeme Text) -> PathContext -> Word32 -> Word32 -> TranslatorState -> TranslatorState

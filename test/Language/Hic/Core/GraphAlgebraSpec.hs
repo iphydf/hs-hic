@@ -45,7 +45,7 @@ spec = do
                 g' = minimize IntMap.empty [] g
             -- Nodes 1 and 2 are identical, so they should be merged.
             IntMap.size (gNodes g') `shouldBe` 2
-            gRoot g' `shouldBe` 1 -- New root index after minimization
+            gRoot g' `shouldBe` 0 -- New root index after minimization
 
         it "minimizes a cyclic graph" $ do
             let nodes = IntMap.fromList

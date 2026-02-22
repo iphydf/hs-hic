@@ -324,13 +324,13 @@ spec = do
                         tR `shouldBe` Unconstrained
                     _ -> expectationFailure "Expected VArray"
 
-            it "joins nullptr_t and Array to Pointer (decay)" $ do
+            it "joins nullptr_t and Array to Array (NullPtrTy <= Array)" $ do
                 let t1 = BuiltinType NullPtrTy
                 let t2 = Array (Just (BuiltinType S32Ty)) []
                 let res = stepB (ProductState PJoin QualTop QualTop False) t1 t2
                 case res of
-                    RValue (VPointer _ Q.QNullable' _) _ _ -> return ()
-                    _ -> expectationFailure $ "Expected VPointer with Q.QNullable', but got: " ++ show res
+                    RValue (VArray _ _) _ _ -> return ()
+                    _ -> expectationFailure $ "Expected VArray, but got: " ++ show res
 
             it "uses QualTop for array dimensions in Join" $ do
                 let t1 = Array (Just (BuiltinType S32Ty)) [Singleton S32Ty 10]
@@ -419,7 +419,6 @@ spec = do
 
     describe "C Pointer Variance Rules" $ do
         it "allows sound T** to T* const* conversion (C rule)" $ do
-            pendingWith "Rigid transition's strict invariance rules currently violate this C subtyping rule"
             -- Join(T**, T* const*) should be T* const*
             let ps = ProductState PJoin QualTop QualTop False
             let t = BuiltinType S32Ty
@@ -431,7 +430,7 @@ spec = do
             case res1 of
                 RValue (VPointer (_, _, ps') _ _) _ _ -> do
                     psQualL ps' `shouldBe` QualLevel1Mutable
-                    psQualR ps' `shouldBe` QualLevel1Mutable
+                    psQualR ps' `shouldBe` QualLevel1Const
                 _ -> expectationFailure "Expected VPointer"
 
         it "meets T** and T* const* to T** (Deep Meet)" $ do
@@ -530,13 +529,14 @@ spec = do
                     psForceConst ps' `shouldBe` False
                 _ -> expectationFailure "Expected VPointer"
 
-        it "returns lower bound in Meet(int, long) in invariant context" $ do
+        it "returns bottom in Meet(int, long) in invariant context" $ do
             let ps = ProductState PMeet QualUnshielded QualUnshielded False
             let t1 = BuiltinType S32Ty
             let t2 = BuiltinType S64Ty
             let res = stepB ps t1 t2
-            -- In the pure lattice, meet(int, long) -> int, regardless of context.
-            res `shouldBe` RValue (VBuiltin S32Ty) Q.QMutable' Nothing
+            -- At invariant positions, different integer types are incomparable,
+            -- so the meet is bottom (Unconstrained).
+            res `shouldBe` RSpecial SUnconstrained
 
     describe "Lattice Property Regressions" $ do
         it "satisfies lower bound for Sized Pointer and Array" $ do

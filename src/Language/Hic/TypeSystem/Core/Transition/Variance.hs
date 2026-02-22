@@ -23,7 +23,7 @@ getTargetState :: (Eq a)
                -> a           -- ^ Left child node ID
                -> a           -- ^ Right child node ID
                -> (ProductState, Bool)
-getTargetState ProductState{..} terminals getQuals _ _ tL tR =
+getTargetState ProductState{..} terminals getQuals _cL _cR tL tR =
     let (_, _, cChildL) = getQuals tL
         (_, _, cChildR) = getQuals tR
 
@@ -33,5 +33,5 @@ getTargetState ProductState{..} terminals getQuals _ _ tL tR =
         isIdentity t = t == (if psPolarity == PJoin then fst terminals else snd terminals)
         isNeutral = isIdentity tL || isIdentity tR
 
-        canJoin = psPolarity == PMeet || tL == tR || isNeutral || allowCovariance psQualL || allowCovariance psQualR
+        canJoin = isNeutral || psPolarity == PMeet || tL == tR || allowCovariance psQualL || allowCovariance psQualR
     in (ProductState psPolarity nextL nextR False, canJoin)

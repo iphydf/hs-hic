@@ -196,7 +196,7 @@ instance ArbitraryTemplateId 'Global where
         [ TIdName . Text.pack <$> arbitrary
         , TIdParam <$> arbitrary <*> (fmap Text.pack <$> arbitrary) <*> arbitrary
         , TIdAnonymous <$> arbitrary <*> (fmap Text.pack <$> arbitrary)
-        , TIdRec <$> arbitrary
+        -- TIdRec is not generated: it's an internal representation for equi-recursive cycles
         ]
 
 instance ArbitraryTemplateId 'Local where
@@ -205,7 +205,7 @@ instance ArbitraryTemplateId 'Local where
         , TIdPoly <$> arbitrary <*> arbitrary <*> (fmap Text.pack <$> arbitrary) <*> arbitrary
         , TIdSolver <$> arbitrary <*> (fmap Text.pack <$> arbitrary)
         , TIdAnonymous <$> arbitrary <*> (fmap Text.pack <$> arbitrary)
-        , TIdRec <$> arbitrary
+        -- TIdRec is not generated: it's an internal representation for equi-recursive cycles
         ]
 
 instance ArbitraryTemplateId p => Arbitrary (TemplateId p) where

@@ -476,12 +476,8 @@ collectRefinementsCimpleExpr reg ctx loc = \case
                 Just nid -> lookThroughVariables nid
                 Nothing  -> return Nothing
             case (op, mId) of
-                (C.UopIncr, Just _) | not (isNumeric mNode) -> do
-                    addError loc (CustomError "Increment operator not supported on pointers in refined analysis")
-                    return Nothing
-                (C.UopDecr, Just _) | not (isNumeric mNode) -> do
-                    addError loc (CustomError "Decrement operator not supported on pointers in refined analysis")
-                    return Nothing
+                (C.UopIncr, Just nid) | not (isNumeric mNode) && isReference mNode -> Just <$> degradeToPointer nid
+                (C.UopDecr, Just nid) | not (isNumeric mNode) && isReference mNode -> Just <$> degradeToPointer nid
                 (C.UopIncr, _) -> return mId
                 (C.UopDecr, _) -> return mId
                 (C.UopAddress, Just nid) -> do
@@ -512,13 +508,19 @@ collectRefinementsCimpleExpr reg ctx loc = \case
             mNodeR <- case mRhs of { Just nid -> lookThroughVariables nid; Nothing -> return Nothing }
             st <- get
             case (op, mLhs, mRhs) of
-                (C.BopPlus, Just _, Just _) | not (isNumeric mNodeL) || not (isNumeric mNodeR) -> do
-                    -- Pointer arithmetic forbidden (Section 2.D)
+                (C.BopPlus, Just lId, Just _) | isReference mNodeL && not (isReference mNodeR) ->
+                    Just <$> degradeToPointer lId
+                (C.BopPlus, Just _, Just rId) | not (isReference mNodeL) && isReference mNodeR ->
+                    Just <$> degradeToPointer rId
+                (C.BopPlus, Just _, Just _) | isReference mNodeL && isReference mNodeR -> do
                     addError loc (CustomError "Pointer arithmetic not supported in refined analysis")
                     return Nothing
-                (C.BopMinus, Just _, Just _) | not (isNumeric mNodeL) || not (isNumeric mNodeR) -> do
-                    -- Pointer subtraction forbidden (Section 2.H)
-                    addError loc (CustomError "Pointer subtraction not supported in refined analysis")
+                (C.BopMinus, Just lId, Just _) | isReference mNodeL && not (isReference mNodeR) ->
+                    Just <$> degradeToPointer lId
+                (C.BopMinus, Just _, Just _) | isReference mNodeL && isReference mNodeR ->
+                    Just <$> translateType (Fix (TS.BuiltinTypeF TS.S64Ty))
+                (C.BopMinus, Just _, Just _) | not (isReference mNodeL) && isReference mNodeR -> do
+                    addError loc (CustomError "Pointer arithmetic not supported in refined analysis")
                     return Nothing
                 (C.BopMul, Just lId, Just rId) -> do
                     -- Handle n * sizeof(T)
@@ -843,6 +845,17 @@ lookThroughVariables nid = do
     st <- get
     let resId = resolveVVar (tsNodes st) (tsConstraints st) nid
     return $ Map.lookup resId (tsNodes st)
+
+-- | Degrade an array reference to a pointer reference, preserving element type
+-- and qualifiers. If the node is already a pointer (or anything else), return
+-- the original ID unchanged.
+degradeToPointer :: Word32 -> State TranslatorState Word32
+degradeToPointer nid = do
+    st <- get
+    case Map.lookup nid (tsNodes st) of
+        Just (AnyRigidNodeF (RReference (Arr elementId _dims) nullability ownership quals)) ->
+            register (AnyRigidNodeF (RReference (Ptr (TargetObject elementId)) nullability ownership quals))
+        _ -> return nid
 
 followToNominal :: TranslatorState -> Word32 -> Maybe (Lexeme TemplateId, [Word32])
 followToNominal st nid =

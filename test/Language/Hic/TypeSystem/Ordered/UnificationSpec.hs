@@ -49,6 +49,7 @@ import           Language.Hic.TypeSystem.Ordered.Unification (Unify,
                                                               UnifyState (..),
                                                               applyBindings,
                                                               applyBindingsDeep,
+                                                              buildBindingsIndex,
                                                               resolveType,
                                                               runUnification,
                                                               subtype, unify)
@@ -56,7 +57,7 @@ import           Test.Hspec
 
 runUnifyWithBindings :: TS.TypeSystem -> Map.Map (TS.FullTemplate 'TS.Local) (TS.TypeInfo 'TS.Local, Provenance 'TS.Local) -> Unify a -> a
 runUnifyWithBindings ts bindings action =
-    evalState action (UnifyState bindings [] ts Set.empty 0 True)
+    evalState action (UnifyState bindings (buildBindingsIndex bindings) [] ts Set.empty 0 True)
 
 spec :: Spec
 spec = do
@@ -374,9 +375,9 @@ spec = do
         let res1 = runUnification ts (subtype sized base GeneralMismatch Nothing [])
         urErrors res1 `shouldSatisfy` null
 
-        -- base <: Sized (disallowed)
+        -- base <: Sized (allowed — Sized is metadata from joinSizer, not a constraint on actual)
         let res2 = runUnification ts (subtype base sized GeneralMismatch Nothing [])
-        length (urErrors res2) `shouldSatisfy` (> 0)
+        urErrors res2 `shouldSatisfy` null
 
     it "handles subtyping between Owner and non-Owner pointers" $ do
         let base = Pointer (BuiltinType S32Ty)
@@ -609,6 +610,26 @@ spec = do
         let base = Pointer (BuiltinType S32Ty)
         let res = runUnification ts (subtype (Nonnull base) (Nullable base) GeneralMismatch Nothing [])
         urErrors res `shouldSatisfy` null
+
+    it "allows subtyping from unqualified pointer to Nonnull pointer" $ do
+        -- int* <: _Nonnull int* (allowed - unqualified is not nullable)
+        let t1 = Pointer (BuiltinType S32Ty)
+        let t2 = Nonnull (Pointer (BuiltinType S32Ty))
+        let res = runUnification ts (subtype t1 t2 GeneralMismatch Nothing [])
+        urErrors res `shouldSatisfy` null
+
+    it "allows subtyping from unqualified struct pointer to Nonnull struct pointer" $ do
+        -- struct S* <: _Nonnull struct S*
+        let s = TS.toLocal 0 TS.TopLevel $ Pointer (TypeRef StructRef (C.L (C.AlexPn 0 0 0) C.IdSueType (TS.TIdName "S")) [])
+        let t2 = Nonnull s
+        let res = runUnification ts (subtype s t2 GeneralMismatch Nothing [])
+        urErrors res `shouldSatisfy` null
+
+    it "disallows subtyping from Nullable pointer to Nonnull pointer" $ do
+        -- _Nullable int* <: _Nonnull int* (disallowed)
+        let base = Pointer (BuiltinType S32Ty)
+        let res = runUnification ts (subtype (Nullable base) (Nonnull base) GeneralMismatch Nothing [])
+        length (urErrors res) `shouldSatisfy` (> 0)
 
     it "disallows subtyping between different TypeRef categories" $ do
         -- struct S <: union S
@@ -933,7 +954,7 @@ spec = do
         let initialBindings = Map.fromList [( t0, (BuiltinType S32Ty, FromContext (ErrorInfo Nothing [] (CustomError "init") [])) )]
         let t1 = TS.toLocal 0 TS.TopLevel $ TypeRef StructRef (C.L (C.AlexPn 0 0 0) C.IdSueType (TS.TIdName "Tox")) [Template (TS.TIdName "T0") Nothing]
         let t2 = TS.toLocal 0 TS.TopLevel $ TypeRef StructRef (C.L (C.AlexPn 0 0 0) C.IdSueType (TS.TIdName "Tox")) [BuiltinType F32Ty]
-        let finalState = State.execState (void $ unify t1 t2 GeneralMismatch Nothing []) (UnifyState initialBindings [] ts Set.empty 0 True)
+        let finalState = State.execState (void $ unify t1 t2 GeneralMismatch Nothing []) (UnifyState initialBindings (buildBindingsIndex initialBindings) [] ts Set.empty 0 True)
         length (usErrors finalState) `shouldSatisfy` (> 0)
 
     it "detects conflict between Template (bound to Struct) and Builtin" $ do
@@ -941,7 +962,7 @@ spec = do
             structTy = TS.toLocal 0 TS.TopLevel $ TypeRef StructRef (C.L (C.AlexPn 0 0 0) C.IdSueType (TS.TIdName "My_Struct")) []
             intTy = BuiltinType S32Ty
             initialBindings = Map.fromList [(t0, (structTy, FromContext (ErrorInfo Nothing [] (CustomError "init") [])))]
-            finalState = State.execState (void $ unify (Template (TS.ftId t0) (TS.ftIndex t0)) intTy GeneralMismatch Nothing []) (UnifyState initialBindings [] ts Set.empty 0 True)
+            finalState = State.execState (void $ unify (Template (TS.ftId t0) (TS.ftIndex t0)) intTy GeneralMismatch Nothing []) (UnifyState initialBindings (buildBindingsIndex initialBindings) [] ts Set.empty 0 True)
         length (usErrors finalState) `shouldSatisfy` (> 0)
 
     it "preserves template arguments of StructRef in resolveType" $ do

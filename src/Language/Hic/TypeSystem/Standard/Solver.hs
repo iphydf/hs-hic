@@ -96,11 +96,13 @@ dtraceM :: Monad m => String -> m ()
 dtraceM msg = if debugging then Debug.traceM msg else return ()
 
 data SolverState = SolverState
-    { ssBindings   :: Map (FullTemplate 'Local) (TypeInfo 'Local, Provenance 'Local)
-    , ssErrors     :: [ErrorInfo 'Local]
-    , ssTypeSystem :: TypeSystem
-    , ssNextId     :: Int
-    , ssFinalPass  :: Bool
+    { ssBindings      :: Map (FullTemplate 'Local) (TypeInfo 'Local, Provenance 'Local)
+    , ssBindingsIndex :: Map (TemplateId 'Local) [FullTemplate 'Local]
+    , ssErrors        :: [ErrorInfo 'Local]
+    , ssTypeSystem    :: TypeSystem
+    , ssNextId        :: Int
+    , ssFinalPass     :: Bool
+    , ssResolvedKeys  :: Set (FullTemplate 'Local)
     }
 
 type Solver = State SolverState
@@ -119,15 +121,39 @@ solveConstraints ts constraints =
             resolveBindings) s3
     in ssErrors finalState
   where
-    initialState = SolverState Map.empty [] ts 0 False
+    initialState = SolverState Map.empty Map.empty [] ts 0 False Set.empty
 
 -- | Resolves all current bindings co-inductively to their fixed points.
+-- Uses incremental resolution: only processes bindings added since the last
+-- call, using the graph solver.
 resolveBindings :: Solver ()
 resolveBindings = do
     bindings <- State.gets ssBindings
-    let graph = Map.map (\(ty, _) -> Set.singleton (TG.fromTypeInfo ty)) bindings
-        resolvedMap = GS.solveAll graph (Map.keys bindings)
-    State.modify $ \s -> s { ssBindings = Map.mapWithKey (\k (ty, prov) -> (maybe ty TG.toTypeInfo (Map.lookup k resolvedMap), prov)) (ssBindings s) }
+    resolvedKeys <- State.gets ssResolvedKeys
+    let newKeys = Map.keysSet bindings `Set.difference` resolvedKeys
+    if Set.null newKeys then return ()
+    else do
+        let resolvedBindings = Map.restrictKeys bindings resolvedKeys
+            newBindings = Map.restrictKeys bindings newKeys
+            preSubst = Map.map (\(ty, prov) -> (substBindings resolvedBindings ty, prov)) newBindings
+            graph = Map.map (\(ty, _) -> Set.singleton (TG.fromTypeInfo ty)) preSubst
+            resolvedMap = GS.solveAll graph (Map.keys preSubst)
+        State.modify $ \s -> s
+            { ssBindings = Map.mapWithKey (\k (ty, prov) ->
+                if Set.member k newKeys
+                then (maybe ty TG.toTypeInfo (Map.lookup k resolvedMap), prov)
+                else (ty, prov)) (ssBindings s)
+            , ssResolvedKeys = Map.keysSet bindings
+            }
+
+-- | Substitutes all bound template variables in a type expression (one level).
+substBindings :: Map (FullTemplate 'Local) (TypeInfo 'Local, Provenance 'Local) -> TypeInfo 'Local -> TypeInfo 'Local
+substBindings bindings = foldFix $ \case
+    TemplateF ft@(FullTemplate tid i) ->
+        case Map.lookup ft bindings of
+            Just (resolved, _) -> resolved
+            Nothing            -> Template tid i
+    f -> Fix f
 
 nextTemplate :: Maybe Text -> Solver (TypeInfo 'Local)
 nextTemplate mHint = do
@@ -328,17 +354,18 @@ bind name index ty reason ml ctx = do
                 Just detail -> reportError ml ctx (TypeMismatch ty' existing reason (Just detail))
                 Nothing -> return ()
 
-    -- Check conflicts with ALL compatible indices, including exact match.
-    -- We do this even if an exact match exists to ensure that conflicts
-    -- detected during inference are also reported during the final pass.
-    forM_ (Map.toList bindings) $ \case
-        (FullTemplate n i, (existing, _)) | n == name ->
-            case (index, i) of
-                (Just idx, Just idx')
-                    | compatible idx idx' || compatible idx' idx -> unifyAndReport existing
-                (Nothing, Nothing) -> unifyAndReport existing
-                _ -> return ()
-        _ -> return ()
+    -- Check conflicts with compatible indices using the bindings index.
+    bindingsIndex <- State.gets ssBindingsIndex
+    let related = Map.findWithDefault [] name bindingsIndex
+    forM_ related $ \ft@(FullTemplate _ i) ->
+        case Map.lookup ft bindings of
+            Just (existing, _) ->
+                case (index, i) of
+                    (Just idx, Just idx')
+                        | compatible idx idx' || compatible idx' idx -> unifyAndReport existing
+                    (Nothing, Nothing) -> unifyAndReport existing
+                    _ -> return ()
+            Nothing -> return ()
 
     -- Now add or update the binding if not already present.
     let k = FullTemplate name index
@@ -349,7 +376,10 @@ bind name index ty reason ml ctx = do
                 then return () -- Occur check failed
                 else do
                     let prov = FromContext (ErrorInfo ml ctx (TypeMismatch (Template name index) ty' reason Nothing) [])
-                    State.modify $ \s -> s { ssBindings = Map.insert k (ty', prov) (ssBindings s) }
+                    State.modify $ \s -> s
+                        { ssBindings = Map.insert k (ty', prov) (ssBindings s)
+                        , ssBindingsIndex = Map.insertWith (++) name [k] (ssBindingsIndex s)
+                        }
 
 occurs :: TemplateId 'Local -> Maybe (TypeInfo 'Local) -> TypeInfo 'Local -> Bool
 occurs name index ty = snd $ foldFix alg ty

@@ -265,7 +265,6 @@ spec = do
 
     describe "join is associative (regression tests)" $ do
         it "is associative for a known counterexample" $ do
-            pendingWith "Join associativity is violated for some complex Pointer/Qualified types"
             let t1 = Array (Just (Pointer VarArg)) []
                 t2 = Pointer (Pointer VarArg)
                 t3 = Pointer (Pointer (Array Nothing []))
@@ -293,7 +292,6 @@ spec = do
             Canonicalization.bisimilar r1 r2 `shouldBe` True
 
         it "is associative for Join failure repro 1" $ do
-            pendingWith "Hypothesis: join is not associative for complex Pointer/Qualified types, likely due to how getTargetState handles forceConst and QualState transitions."
             let t1 = Pointer (BuiltinType NullPtrTy)
                 t2 = Unconstrained
                 t3 = Pointer (Pointer VarArg)
@@ -308,7 +306,6 @@ spec = do
                 expectationFailure $ "r1: " ++ show r1 ++ "\nr2: " ++ show r2
 
         it "is associative for Join failure repro 2" $ do
-            pendingWith "Hypothesis: join is not associative for complex Pointer/Qualified types, likely due to how getTargetState handles forceConst and QualState transitions."
             let t1 = TS.Nullable (TS.Pointer (TS.Const (TS.Pointer (TS.Singleton TS.SizeTy 1))))
                 t2 = Array (Just (Pointer Unconstrained)) []
                 t3 = BuiltinType NullPtrTy

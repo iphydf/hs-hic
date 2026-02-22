@@ -34,12 +34,15 @@ module Language.Hic.TypeSystem.Core.TypeGraph
     , lfp
     , minimizeGraph
     , normalizeGraph
+    , collectTemplateVarsFromGraph
     , tgNodes
     , tgRoot
     , getNode
     )
 where
 
+import           Control.Applicative                            ((<|>))
+import           Control.Monad                                 (when)
 import           Control.Monad.State.Strict                    (get, modify,
                                                                 put, runState,
                                                                 state)
@@ -262,8 +265,19 @@ substitute v vGraph (TypeGraph nodes root) =
             Nothing -> do
                 let node = IntMap.findWithDefault (RSpecial SConflict) i nodes
                 case node of
-                    RValue (VTemplate ft _ _) _ _ | TS.voidFullTemplate ft == v' -> do
+                    RValue (VTemplate ft n o) c s | TS.voidFullTemplate ft == v' -> do
                         i' <- mergeVGraph vGraph'
+                        -- Propagate qualifiers from the host template node to the
+                        -- substitution graph's root so they are not silently dropped.
+                        let applyNO (VPointer a n' o')  = VPointer a (max n n') (max o o')
+                            applyNO (VTemplate ft' n' o') = VTemplate ft' (max n n') (max o o')
+                            applyNO v'                  = v'
+                            applyQ = \case
+                                RValue v' c' s' -> RValue (applyNO v') (max c c') (s <|> s')
+                                RFunction r ps c' s' -> RFunction r ps (max c c') (s <|> s')
+                                nd -> nd
+                        when (i' >= 0) $
+                            modify $ \(nId, o2n', acc) -> (nId, o2n', IntMap.adjust applyQ i' acc)
                         modify $ \(nId, o2n', acc) -> (nId, Map.insert i i' o2n', acc)
                         return i'
                     _ -> do
@@ -303,7 +317,7 @@ minimizeGraph :: forall p. (Ord (TemplateId p)) => TypeGraph p -> TypeGraph p
 minimizeGraph (TypeGraph nodes root) =
     let structuredTerminals = IntMap.fromList [(-1, RSpecial SUnconstrained), (-2, RSpecial SConflict)]
         normNodes = IntMap.map stripLexeme nodes
-    in GA.minimize structuredTerminals [] (TypeGraph normNodes root)
+    in normalizeGraph $ GA.minimize structuredTerminals [] (TypeGraph normNodes root)
 
 -- | Strips source positions from lexemes in a type node.
 stripLexeme :: RigidNodeF tid a -> RigidNodeF tid a
@@ -320,6 +334,14 @@ stripLexeme = \case
         VNameLit l -> VNameLit (stripL l)
         VEnumMem l -> VEnumMem (stripL l)
         s -> s
+
+-- | Collects template variables directly from graph nodes, avoiding the
+-- roundtrip through 'toTypeInfo' and 'collectUniqueTemplateVars'.
+collectTemplateVarsFromGraph :: TypeGraph p -> [TS.FullTemplate p]
+collectTemplateVarsFromGraph (TypeGraph nodes _) =
+    [ fmap (\i -> toTypeInfo (TypeGraph nodes i)) ft
+    | RValue (VTemplate ft _ _) _ _ <- IntMap.elems nodes
+    ]
 
 -- | Normalizes node IDs in a graph to ensure a canonical 'IntMap' representation.
 normalizeGraph :: TypeGraph p -> TypeGraph p

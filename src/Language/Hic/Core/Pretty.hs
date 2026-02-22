@@ -149,6 +149,7 @@ ppReason = \case
     ArgumentMismatch i -> "argument" <+> pretty i
     AssignmentMismatch -> "assignment"
     InitializerMismatch -> "initializer"
+    CastMismatch -> "cast"
 
 ppNodeSnippet :: C.NodeF (Lexeme Text) a -> Doc AnsiStyle
 ppNodeSnippet = \case
@@ -175,6 +176,7 @@ ppTypeError = \case
                             ArgumentMismatch i -> "argument" <+> literalStyle (pretty i) <+> "type mismatch"
                             AssignmentMismatch -> "assignment type mismatch"
                             InitializerMismatch -> "initializer type mismatch"
+                            CastMismatch -> "cast type mismatch"
             baseErr = reasonDoc <> ":" <+> "expected" <+> ppType exp' <> "," <+> "got" <+> ppType act
         in case mDetail of
             Just detail -> baseErr <> line <> indent 2 (ppMismatchDetail detail)

@@ -212,7 +212,7 @@ solveConstraints ts activePhases initialBindingsMap constraints =
         Equality t1 t2 _ _ _ -> decomposeEquality graph t1 t2
         Subtype actual expected _ _ _ -> decomposeSubtype graph actual expected
         Lub t t_list _ _ _ ->
-            foldl' (\acc t_in -> addEdge acc t t_in) graph t_list
+            foldl' (\acc t_in -> decomposeLub acc t t_in) graph t_list
         _ -> graph
 
     decomposeEquality graph t1 t2 =
@@ -228,7 +228,8 @@ solveConstraints ts activePhases initialBindingsMap constraints =
                 in foldl' (\g (pp1, pp2) -> decomposeEquality g pp1 pp2) gRet (zip p1 p2)
             (QualifiedF qs1 a, QualifiedF qs2 b) | qs1 == qs2 -> decomposeEquality graph a b
             (VarF _ a, VarF _ b) -> decomposeEquality graph a b
-            _ -> graph
+            -- Structural mismatch: no assignment can make these equal.
+            _ -> markConflict graph [t1, t2]
 
     decomposeSubtype graph actual expected =
         case (unFix actual, unFix expected) of
@@ -243,14 +244,42 @@ solveConstraints ts activePhases initialBindingsMap constraints =
                 -- Contravariant parameters: expected <: actual for parameters
                 in foldl' (\g (pActual, pExpected) -> decomposeSubtype g pExpected pActual) gRet (zip p1 p2)
             (QualifiedF qs1 a, QualifiedF qs2 b) ->
-                if subtypeQuals qs1 qs2 then decomposeSubtype graph a b else graph
+                if subtypeQuals qs1 qs2 then decomposeSubtype graph a b else markConflict graph [actual, expected]
             (VarF _ a, VarF _ b) -> decomposeSubtype graph a b
             -- Peeling wrappers
             (QualifiedF qs a, b) ->
-                if subtypeQuals qs Set.empty then decomposeSubtype graph a (Fix b) else graph
+                if subtypeQuals qs Set.empty then decomposeSubtype graph a (Fix b) else markConflict graph [actual, expected]
             (a, QualifiedF es b) ->
-                if subtypeQuals Set.empty es then decomposeSubtype graph (Fix a) b else graph
-            _ -> graph
+                if subtypeQuals Set.empty es then decomposeSubtype graph (Fix a) b else markConflict graph [actual, expected]
+            -- Structural mismatch: no assignment can satisfy this subtype relationship.
+            _ -> markConflict graph [actual, expected]
+
+    -- | Decompose a Lub constraint: t_in <: t (each list element is a lower bound for the target).
+    -- When the target contains templates wrapped in structure, we push requirements
+    -- into nested templates.  On structural mismatch, any templates in the target
+    -- are marked Conflict because no assignment can satisfy the constraint.
+    decomposeLub graph t t_in =
+        case (unFix t, unFix t_in) of
+            -- Target is a bare template: add t_in as a lower bound.
+            (TemplateF _, _) -> addEdge graph t t_in
+            -- Element is a bare template: add t as its lower bound (t_in <: t).
+            (_, TemplateF _) -> addEdge graph t_in t
+            -- Bottom is <: anything; skip.
+            (_, ConflictF) -> graph
+            -- Top is always a valid upper bound; skip.
+            (_, UnconstrainedF) -> graph
+            -- Matching structure: decompose into children.
+            (PointerF a, PointerF b) -> decomposeLub graph a b
+            (ArrayF (Just a) _, ArrayF (Just b) _) -> decomposeLub graph a b
+            (FunctionF r1 p1, FunctionF r2 p2) | length p1 == length p2 ->
+                -- Covariant return: r_in <: r  (accumulate lower bounds for r's templates)
+                let gRet = decomposeLub graph r1 r2
+                -- Contravariant params: p <: p_in  (use subtype decomposition)
+                in foldl' (\g (pTarget, pIn) -> decomposeSubtype g pTarget pIn) gRet (zip p1 p2)
+            (QualifiedF qs1 a, QualifiedF qs2 b) | subtypeQuals qs2 qs1 -> decomposeLub graph a b
+            (VarF _ a, VarF _ b) -> decomposeLub graph a b
+            -- Structural mismatch: mark all templates in both sides as Conflict.
+            _ -> markConflict graph [t, t_in]
 
     decomposeEqualityG graph g1 g2 =
         let t1 = TG.toTypeInfo g1
@@ -292,6 +321,11 @@ solveConstraints ts activePhases initialBindingsMap constraints =
             (_, QualifiedF es b) ->
                 if subtypeQuals Set.empty es then decomposeSubtypeG graph g1 (TG.fromTypeInfo b) else graph
             _ -> graph
+
+    -- | Mark all templates in the given types as Conflict (unsatisfiable constraint).
+    markConflict graph tys =
+        let templates = collectUniqueTemplateVars tys
+        in foldl' (\g ft -> Map.insertWith Set.union ft (Set.singleton TS.Conflict) g) graph templates
 
     addEdge graph (Fix (TemplateF ft)) val =
         let res = if ft `elem` TS.collectUniqueTemplateVars [val]

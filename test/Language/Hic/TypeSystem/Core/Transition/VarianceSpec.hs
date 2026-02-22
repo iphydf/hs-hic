@@ -58,12 +58,12 @@ spec = do
                     (_, can) = getTargetState ps terminals getQuals cL cR tL tR
                 in can `shouldBe` True
 
-            prop "canJoin is only True for Join if covariance is allowed or targets match" $ \pol qL qR (cL :: Constness) (cR :: Constness) (tL :: Int) (tR :: Int) ->
+            prop "canJoin is only True for Join if covariance is allowed, targets match, or one is identity" $ \pol qL qR (cL :: Constness) (cR :: Constness) (tL :: Int) (tR :: Int) ->
                 let ps = ProductState pol qL qR False
                     (_, can) = getTargetState ps terminals getQuals cL cR tL tR
-                    nextL = stepQual qL (cL == QConst')
-                    nextR = stepQual qR (cR == QConst')
-                in if pol == PMeet || tL == tR || allowCovariance qL || allowCovariance qR
+                    isIdentity t = t == (if pol == PJoin then bot else top)
+                    isNeutral = isIdentity tL || isIdentity tR
+                in if pol == PMeet || isNeutral || tL == tR || allowCovariance qL || allowCovariance qR
                    then can `shouldBe` True
                    else can `shouldBe` False
 

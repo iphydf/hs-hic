@@ -301,21 +301,19 @@ spec = do
                 ]
 
     describe "Pointer Arithmetic and Arrays" $ do
-        it "forbids pointer arithmetic on raw pointers (Section 2.D)" $ do
-            shouldHaveRefinedError
+        it "supports pointer increment (degrades to pointer)" $ do
+            shouldHaveNoRefinedErrors
                 [ "void test(int32_t *p) {"
                 , "    ++p;"
                 , "}"
                 ]
-                ["Increment operator not supported on pointers in refined analysis"]
 
-        it "forbids pointer subtraction (Section 2.H)" $ do
-            shouldHaveRefinedError
+        it "supports pointer subtraction (returns ptrdiff_t)" $ do
+            shouldHaveNoRefinedErrors
                 [ "void test(int32_t *p1, int32_t *p2) {"
                 , "    int64_t d = p1 - p2;"
                 , "}"
                 ]
-                ["Pointer subtraction not supported in refined analysis"]
 
     describe "Recursive Refresh" $ do
         it "supports isolated use of void* in struct fields for different instances (Section 5.C)" $ do
@@ -763,14 +761,12 @@ spec = do
                 , "}"
                 ]
 
-        it "forbids non-homogeneous size arithmetic (Section 10.B)" $ do
-            -- Adding a constant to a type property is forbidden.
-            shouldHaveRefinedError
+        it "allows size arithmetic with constants (Section 10.B)" $ do
+            shouldHaveNoRefinedErrors
                 [ "void test() {"
                 , "    uint64_t sz = sizeof(int32_t) + 1;"
                 , "}"
                 ]
-                ["Pointer arithmetic not supported in refined analysis"]
 
     describe "Numeric Coercion" $ do
         it "allows assigning between different integer types (Section 1.E)" $ do

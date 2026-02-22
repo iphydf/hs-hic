@@ -50,6 +50,7 @@ import           Language.Hic.Core.AstUtils                      (getAlexPosn,
 import           Language.Hic.Core.Errors                        (Context (..),
                                                                   MismatchReason (..))
 import           Language.Hic.Core.TypeSystem                    (Phase (..),
+                                                                  Qualifier (..),
                                                                   StdType (..),
                                                                   TemplateId (..),
                                                                   TypeDescr (..),
@@ -66,7 +67,9 @@ import           Language.Hic.Core.TypeSystem                    (Phase (..),
                                                                   pattern Nullable,
                                                                   pattern Owner,
                                                                   pattern Pointer,
+                                                                  pattern Qualified,
                                                                   pattern Singleton,
+                                                                  pattern Sized,
                                                                   pattern Template,
                                                                   pattern TypeRef,
                                                                   pattern Unsupported,
@@ -74,7 +77,6 @@ import           Language.Hic.Core.TypeSystem                    (Phase (..),
 import           Language.Hic.TypeSystem.Core.Base               (getInnerType,
                                                                   isPointerLike,
                                                                   promote,
-                                                                  promoteNonnull,
                                                                   stripAllWrappers,
                                                                   unwrap)
 import qualified Language.Hic.TypeSystem.Core.Base               as TS
@@ -224,6 +226,14 @@ lookupVar name = do
                 _ -> return $ Unsupported $ "undefined variable: " <> name
     dtraceM $ "lookupVar result: " ++ show res
     return res
+
+-- | Promote Nullable to Nonnull in qualifier wrappers, but stop at structural
+-- types (Pointer, Array, etc.) to avoid corrupting pointee qualifiers.
+promoteNonnull :: TypeInfo p -> TypeInfo p
+promoteNonnull (Qualified qs t) = Qualified (Set.insert QNonnull (Set.delete QNullable qs)) (promoteNonnull t)
+promoteNonnull (Var l t)        = Var l (promoteNonnull t)
+promoteNonnull (Sized t l)      = Sized (promoteNonnull t) l
+promoteNonnull t                = t
 
 traverseNode :: Node (Lexeme Text) -> Extract (TypeInfo 'Local)
 traverseNode = snd . foldFix alg
@@ -809,7 +819,7 @@ inferExpr (Fix node') = do
                 then return t
                 else do
                     ctx <- State.gets esContext
-                    addConstraint $ Subtype et t (getLexeme e) ctx GeneralMismatch
+                    addConstraint $ Subtype et t (getLexeme e) ctx CastMismatch
                     return t
         C.CompoundLiteral ty e -> do
             t <- convertToTypeInfo ty

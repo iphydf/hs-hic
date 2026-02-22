@@ -46,8 +46,7 @@ spec = do
                 mergeAtoms' psJoin (VBuiltin S16Ty) (VBuiltin S32Ty) `shouldBe` Just (VBuiltin S32Ty, False, True)
 
             it "enforces invariance for different builtins" $
-                -- This now returns Just but with False for ident. Caller must check invariance.
-                mergeAtoms' psJoinInv (VBuiltin S16Ty) (VBuiltin S32Ty) `shouldBe` Just (VBuiltin S32Ty, False, True)
+                mergeAtoms' psJoinInv (VBuiltin S16Ty) (VBuiltin S32Ty) `shouldBe` Nothing
 
         describe "VSingleton" $ do
             it "joins identical singletons" $
@@ -56,7 +55,7 @@ spec = do
             it "widens singletons with different values" $
                 mergeAtoms' psJoin (VSingleton S32Ty 10) (VSingleton S32Ty 20) `shouldBe` Just (VBuiltin S32Ty, False, False)
 
-            it "enforces invariance for mismatched singletons" $
+            it "widens singletons with different values at invariant (same C type)" $
                 mergeAtoms' psJoinInv (VSingleton S32Ty 10) (VSingleton S32Ty 20) `shouldBe` Just (VBuiltin S32Ty, False, False)
 
         describe "Cross merge (Builtin vs Singleton)" $ do
@@ -67,7 +66,12 @@ spec = do
                 mergeAtoms' psMeet (VSingleton S32Ty 10) (VBuiltin S32Ty) `shouldBe` Just (VSingleton S32Ty 10, True, False)
 
             it "enforces invariance for different base types" $
-                mergeAtoms' psJoinInv (VSingleton S16Ty 10) (VBuiltin S32Ty) `shouldBe` Just (VBuiltin S32Ty, False, True)
+                mergeAtoms' psJoinInv (VSingleton S16Ty 10) (VBuiltin S32Ty) `shouldBe` Nothing
+
+            it "allows singleton-to-builtin widening at invariant (same C type)" $ do
+                let psMeetInv = ProductState PMeet QualUnshielded QualUnshielded False
+                mergeAtoms' psJoinInv (VSingleton S32Ty 10) (VBuiltin S32Ty) `shouldBe` Just (VBuiltin S32Ty, False, True)
+                mergeAtoms' psMeetInv (VSingleton S32Ty 10) (VBuiltin S32Ty) `shouldBe` Just (VSingleton S32Ty 10, True, False)
 
         it "correctly identifies side-specific identity" $ do
             let ps = ProductState PMeet QualTop QualTop False

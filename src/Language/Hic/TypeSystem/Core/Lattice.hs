@@ -38,7 +38,6 @@ import           Language.Hic.TypeSystem.Core.Transition       (Polarity (..),
                                                                 RigidNodeF (..),
                                                                 ValueStructure (..))
 import           Language.Hic.TypeSystem.Core.TypeGraph        (TypeGraph,
-                                                                normalizeGraph,
                                                                 productConstruction)
 import qualified Language.Hic.TypeSystem.Core.TypeGraph        as TG
 import           Language.Hic.TypeSystem.Core.Subtype          (subtypeOfGraph)
@@ -63,14 +62,14 @@ joinGraph isVar g1 g2 =
     let isVarNode = \case
             RValue (VTemplate ft _ _) _ _ -> isVar (fmap (const TS.Unconstrained) ft)
             _ -> False
-    in productConstruction isVarNode TG.PJoin (normalizeGraph g1) (normalizeGraph g2)
+    in productConstruction isVarNode TG.PJoin g1 g2
 
 meetGraph :: forall p. (TS.FullTemplate p -> Bool) -> TypeGraph p -> TypeGraph p -> TypeGraph p
 meetGraph isVar g1 g2 =
     let isVarNode = \case
             RValue (VTemplate ft _ _) _ _ -> isVar (fmap (const TS.Unconstrained) ft)
             _ -> False
-    in productConstruction isVarNode TG.PMeet (normalizeGraph g1) (normalizeGraph g2)
+    in productConstruction isVarNode TG.PMeet g1 g2
 
 meet :: TypeInfo p -> TypeInfo p -> TypeInfo p
 meet = meetSymbolic (const False)
