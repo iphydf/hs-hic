@@ -41,11 +41,13 @@ import           Language.Hic.TypeSystem.Core.TypeGraph        (TypeGraph,
                                                                 normalizeGraph,
                                                                 productConstruction)
 import qualified Language.Hic.TypeSystem.Core.TypeGraph        as TG
+import           Language.Hic.TypeSystem.Core.Subtype          (subtypeOfGraph)
 
-subtypeOf :: TypeInfo p -> TypeInfo p -> Bool
+subtypeOf :: forall p. (Ord (TS.TemplateId p)) => TypeInfo p -> TypeInfo p -> Bool
 subtypeOf t1 t2 =
-    let m = meet t1 t2
-    in Canonicalization.bisimilar (TS.normalizeType m) (TS.normalizeType t1)
+    let g1 = TG.minimizeGraph (TG.fromTypeInfo t1)
+        g2 = TG.minimizeGraph (TG.fromTypeInfo t2)
+    in subtypeOfGraph g1 g2
 
 join :: TypeInfo p -> TypeInfo p -> TypeInfo p
 join = joinSymbolic (const False)

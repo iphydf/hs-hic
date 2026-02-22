@@ -27,19 +27,11 @@ getTargetState ProductState{..} terminals getQuals _ _ tL tR =
     let (_, _, cChildL) = getQuals tL
         (_, _, cChildR) = getQuals tR
 
-        nextL_base = stepQual psQualL (cChildL == QConst')
-        nextR_base = stepQual psQualR (cChildR == QConst')
-        invariance_base = not (allowCovariance nextL_base || allowCovariance nextR_base)
+        nextL = stepQual psQualL (cChildL == QConst')
+        nextR = stepQual psQualR (cChildR == QConst')
 
         isIdentity t = t == (if psPolarity == PJoin then fst terminals else snd terminals)
         isNeutral = isIdentity tL || isIdentity tR
 
-        -- Sound LUB discovery: force const only if targets differ and we are in an invariant context.
-        -- Terminals (Unconstrained/Conflict) are neutral and don't trigger forceConst.
-        forceConst = psPolarity == PJoin && not (tL == tR || isNeutral) && invariance_base
-
-        nextL = if forceConst then stepQual psQualL True else nextL_base
-        nextR = if forceConst then stepQual psQualR True else nextR_base
-
-        canJoin = psPolarity == PMeet || tL == tR || isNeutral || allowCovariance nextL || allowCovariance nextR || forceConst
-    in (ProductState psPolarity nextL nextR forceConst, canJoin)
+        canJoin = psPolarity == PMeet || tL == tR || isNeutral || allowCovariance psQualL || allowCovariance psQualR
+    in (ProductState psPolarity nextL nextR False, canJoin)

@@ -9,7 +9,9 @@ import           Test.QuickCheck
 import           Language.Hic.TypeSystem.Core.Qualification       (Constness (..),
                                                                    Nullability (..),
                                                                    Ownership (..),
-                                                                   QualState (..))
+                                                                   QualState (..),
+                                                                   allowCovariance,
+                                                                   stepQual)
 import           Language.Hic.TypeSystem.Core.Transition.Types
 import           Language.Hic.TypeSystem.Core.Transition.Variance
 
@@ -37,16 +39,18 @@ spec = do
                     (ps', _) = getTargetState ps terminals getQuals c c child top
                 in psForceConst ps' `shouldBe` False
 
-        describe "Sound LUB Discovery" $ do
-            it "forces const when concrete targets differ at top level" $ do
+        describe "Sound LUB Discovery (Strict Rules)" $ do
+            it "does not force const when concrete targets differ at top level (LUB is structural)" $ do
                 let ps = ProductState PJoin QualTop QualTop False
-                let (ps', _) = getTargetState ps terminals getQuals QMutable' QMutable' 10 20
-                psForceConst ps' `shouldBe` True
+                let (ps', can) = getTargetState ps terminals getQuals QMutable' QMutable' 10 20
+                psForceConst ps' `shouldBe` False
+                can `shouldBe` True
 
-            it "forces const when concrete targets differ in invariant context" $ do
+            it "refuses to join when concrete targets differ in invariant context" $ do
                 let ps = ProductState PJoin QualUnshielded QualUnshielded False
-                let (ps', _) = getTargetState ps terminals getQuals QMutable' QMutable' 10 20
-                psForceConst ps' `shouldBe` True
+                let (ps', can) = getTargetState ps terminals getQuals QMutable' QMutable' 10 20
+                psForceConst ps' `shouldBe` False
+                can `shouldBe` False
 
         describe "Structural Persistence" $ do
             prop "canJoin is True for Meet" $ \qL qR (cL :: Constness) (cR :: Constness) (tL :: Int) (tR :: Int) ->
@@ -54,10 +58,14 @@ spec = do
                     (_, can) = getTargetState ps terminals getQuals cL cR tL tR
                 in can `shouldBe` True
 
-            prop "canJoin is True for Join (Sound LUB Discovery)" $ \qL qR (cL :: Constness) (cR :: Constness) (tL :: Int) (tR :: Int) ->
-                let ps = ProductState PJoin qL qR False
+            prop "canJoin is only True for Join if covariance is allowed or targets match" $ \pol qL qR (cL :: Constness) (cR :: Constness) (tL :: Int) (tR :: Int) ->
+                let ps = ProductState pol qL qR False
                     (_, can) = getTargetState ps terminals getQuals cL cR tL tR
-                in can `shouldBe` True
+                    nextL = stepQual qL (cL == QConst')
+                    nextR = stepQual qR (cR == QConst')
+                in if pol == PMeet || tL == tR || allowCovariance qL || allowCovariance qR
+                   then can `shouldBe` True
+                   else can `shouldBe` False
 
     describe "C11 Subtyping (Const-Shielding)" $ do
         it "allows covariance on the side that is const in PMeet" $ do

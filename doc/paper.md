@@ -57,10 +57,10 @@ linear-time constraints by enforcing the following axioms:
 
 ### 2.1. Nominal Stability
 
-Standard C permits "structural punning"—treating a struct as a different type if
-the layout matches. Hic enforces **Nominal Identity**: a pointer to `struct A`
-can never be cast to `struct B`, regardless of physical layout. This reduces
-type equality checks from graph isomorphism problems to $O(1)$ nominal
+Standard C permits "structural punning", i.e. treating a struct as a different
+type if the layout matches. Hic enforces **Nominal Identity**: a pointer to
+`struct A` can never be cast to `struct B`, regardless of physical layout. This
+reduces type equality checks from graph isomorphism problems to $O(1)$ nominal
 comparisons.
 
 ### 2.2. Ownership Invariance
@@ -171,7 +171,7 @@ Hic was evaluated on **Toxcore**, a ~100k LOC networking library.
 ## 7. Conclusion
 
 The novelty of Hic lies not in the underlying type theory, but in the
-engineering of a language subset—**Strict Hic**—that renders that theory
+engineering of a language subset (**Strict Hic**) that renders that theory
 computationally tractable for legacy systems. By requiring code to be
 "idiomatically compliant" and rejecting the underspecified or ambiguous features
 of the C specification, we enable sound, whole-program verification without the

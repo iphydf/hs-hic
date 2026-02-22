@@ -73,6 +73,7 @@ library
     Language.Hic.TypeSystem.Core.Qualification
     Language.Hic.TypeSystem.Core.Solver
     Language.Hic.TypeSystem.Core.Substitution
+    Language.Hic.TypeSystem.Core.Subtype
     Language.Hic.TypeSystem.Core.Transition
     Language.Hic.TypeSystem.Core.Transition.Atoms
     Language.Hic.TypeSystem.Core.Transition.Types

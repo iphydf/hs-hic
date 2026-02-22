@@ -153,7 +153,7 @@ step ps@ProductState{..} lookupNode getQuals terminals isStrictlyIdentical nL nR
     | otherwise = case (nL, nR) of
         (RValue vL cL sL, RValue vR cR sR) ->
             case stepValueStructure ps lookupNode getQuals terminals cL cR vL vR of
-                Just (resV, identLV, identRV) ->
+                Just (resV, _, _) ->
                     let resC = case psPolarity of { PJoin -> max cL cR; PMeet -> min cL cR }
                         resC' = if psForceConst then QConst' else resC
                         (resS, sizeConflict) = case psPolarity of
@@ -164,17 +164,8 @@ step ps@ProductState{..} lookupNode getQuals terminals isStrictlyIdentical nL nR
                                 (Nothing, Just l)  -> (Just l, False)
                                 (Nothing, Nothing) -> (Nothing, False)
 
-                        forceConstJoin = psPolarity == PJoin && not (isStrictlyIdentical || (identLV && identRV && cL == cR) || (isNull vL && isNull vR)) && not (allowCovariance psQualL || allowCovariance psQualR)
-                        resC'' = if forceConstJoin then QConst' else resC'
-
-                        identL = isStrictlyIdentical || (identLV && cL == resC'') || isNull vL
-                        identR = isStrictlyIdentical || (identRV && cR == resC'') || isNull vR
-
-                        invarianceL = not (psForceConst || allowCovariance psQualL)
-                        invarianceR = not (psForceConst || allowCovariance psQualR)
-
-                    in if sizeConflict || (invarianceL && not identL) || (invarianceR && not identR) then zero ps
-                       else RValue resV resC'' resS
+                    in if sizeConflict then zero ps
+                       else RValue resV resC' resS
                 Nothing -> zero ps
 
         (RFunction rL pL cL sL, RFunction rR pR cR sR) ->
@@ -182,15 +173,6 @@ step ps@ProductState{..} lookupNode getQuals terminals isStrictlyIdentical nL nR
             else
                 let resC = case psPolarity of { PJoin -> max cL cR; PMeet -> min cL cR }
                     resC' = if psForceConst then QConst' else resC
-
-                    forceConstJoin = psPolarity == PJoin && not (isStrictlyIdentical || (rL == rR && pL == pR && cL == cR)) && not (allowCovariance psQualL || allowCovariance psQualR)
-                    resC'' = if forceConstJoin then QConst' else resC'
-
-                    identL = isStrictlyIdentical || (cL == resC'')
-                    identR = isStrictlyIdentical || (cR == resC'')
-
-                    invarianceL = not (psForceConst || allowCovariance psQualL)
-                    invarianceR = not (psForceConst || allowCovariance psQualR)
 
                     psRes = ps { psQualL = QualTop, psQualR = QualTop, psForceConst = False }
                     psContra = psRes { psPolarity = flipPol psPolarity }
@@ -202,8 +184,8 @@ step ps@ProductState{..} lookupNode getQuals terminals isStrictlyIdentical nL nR
                             (Just l, Nothing)  -> (Just l, False)
                             (Nothing, Just l)  -> (Just l, False)
                             (Nothing, Nothing) -> (Nothing, False)
-                in if sizeConflict || (invarianceL && not identL) || (invarianceR && not identR) then zero ps
-                   else RFunction (rL, rR, psRes) (zipWith (\l r -> (l, r, psContra)) pL pR) resC'' resS
+                in if sizeConflict then zero ps
+                   else RFunction (rL, rR, psRes) (zipWith (\l r -> (l, r, psContra)) pL pR) resC' resS
 
         _ -> zero ps
 
@@ -244,11 +226,28 @@ stepValueStructure :: (Eq tid, Eq a, Show a, Ord a)
                    -> ValueStructure tid a
                    -> ValueStructure tid a
                    -> Maybe (ValueStructure tid (a, a, ProductState), Bool, Bool)
-stepValueStructure ps@ProductState{..} _ getQuals terminals cL cR sL sR =
+stepValueStructure ps@ProductState{..} lookupNode getQuals terminals cL cR sL sR =
     let bot = fst terminals
         top = snd terminals
-        isIdentity t = t == (if psPolarity == PJoin then bot else top)
+        
+        isNodeIdentity t tgt = t == tgt || case lookupNode t of
+            Just (RSpecial SUnconstrained) -> tgt == fst terminals
+            Just (RSpecial SConflict)      -> tgt == snd terminals
+            Just (RValue (VTemplate _ _ _) _ _) -> t == tgt
+            Just (RValue (VSingleton _ _) _ _) -> t == tgt
+            Just (RValue (VBuiltin _) _ _) -> t == tgt
+            Just (RValue (VIntLit _) _ _) -> t == tgt
+            Just (RValue (VNameLit _) _ _) -> t == tgt
+            Just (RValue (VEnumMem _) _ _) -> t == tgt
+            Just (RValue (VVarArg) _ _) -> t == tgt
+            Just (RValue (VExternal _) _ _) -> t == tgt
+            Just (RValue (VTypeRef _ _ _) _ _) -> t == tgt
+            Just (RFunction _ _ _ _) -> t == tgt
+            _ -> False
+
+        isIdentity t = isNodeIdentity t (if psPolarity == PJoin then bot else top)
         isNeutral' t = isIdentity t
+        isTerminal' t = isNodeIdentity t bot || isNodeIdentity t top
     in case mergeAtoms ps sL sR of
         Just (res, identL, identR) -> Just (fmap (\x -> (x, x, ps)) res, identL, identR)
         Nothing -> case (sL, sR) of
@@ -256,8 +255,8 @@ stepValueStructure ps@ProductState{..} _ getQuals terminals cL cR sL sR =
                 let (resState, canJoin) = getTargetState ps terminals getQuals cL cR tL tR
                     resN = case psPolarity of { PJoin -> max nL nR; PMeet -> min nL nR }
                     resO = case psPolarity of { PJoin -> max oL oR; PMeet -> min oL oR }
-                    identL = tL == tR || isNeutral' tR || isNeutral' tL
-                    identR = tR == tL || isNeutral' tL || isNeutral' tR
+                    identL = tL == tR || isTerminal' tL || isNeutral' tR
+                    identR = tR == tL || isTerminal' tR || isNeutral' tL
                 in if canJoin then Just (VPointer (tL, tR, resState) resN resO, identL, identR)
                    else Nothing
 
@@ -266,11 +265,11 @@ stepValueStructure ps@ProductState{..} _ getQuals terminals cL cR sL sR =
                     (resState, canJoin) = getTargetState ps terminals getQuals cL cR tL tR
                     resN = case psPolarity of { PJoin -> max nullL QUnspecified; PMeet -> min nullL QUnspecified }
                     resO = case psPolarity of { PJoin -> max oL QNonOwned'; PMeet -> min oL QNonOwned' }
-                    identL = (tL == tR || isNeutral' tR || isNeutral' tL) && null dsR
-                    identR = (tR == tL || isNeutral' tL || isNeutral' tR) && null dsR
+                    identL = (tL == tR || isTerminal' tL || isNeutral' tR) && null dsR
+                    identR = (tR == tL || isTerminal' tR || isNeutral' tL) && null dsR
                 in if canJoin then case psPolarity of
                     PJoin -> Just (VPointer (tL, tR, resState) resN resO, identL, identR)
-                    PMeet -> Just (VArray (Just (tL, tR, resState)) (map (\r -> (top, r, ps { psQualL = QualTop, psQualR = QualTop })) dsR), identL, identR)
+                    PMeet -> Just (VArray (Just (tL, tR, resState)) (map (\r -> (top, r, ps { psQualL = QualTop, psQualR = QualTop })) dsR), identL, False)
                    else Nothing
 
             (VArray mL dsL, VPointer tR nullR oR) ->
@@ -278,11 +277,11 @@ stepValueStructure ps@ProductState{..} _ getQuals terminals cL cR sL sR =
                     (resState, canJoin) = getTargetState ps terminals getQuals cL cR tL tR
                     resN = case psPolarity of { PJoin -> max QUnspecified nullR; PMeet -> min QUnspecified nullR }
                     resO = case psPolarity of { PJoin -> max QNonOwned' oR; PMeet -> min QNonOwned' oR }
-                    identL = (tL == tR || isNeutral' tR || isNeutral' tL) && null dsL
-                    identR = (tR == tL || isNeutral' tL || isNeutral' tR) && null dsL
+                    identL = (tL == tR || isTerminal' tL || isNeutral' tR) && null dsL
+                    identR = (tR == tL || isTerminal' tR || isNeutral' tL) && null dsL
                 in if canJoin then case psPolarity of
                     PJoin -> Just (VPointer (tL, tR, resState) resN resO, identL, identR)
-                    PMeet -> Just (VArray (Just (tL, tR, resState)) (map (\l -> (l, top, ps { psQualL = QualTop, psQualR = QualTop })) dsL), identL, identR)
+                    PMeet -> Just (VArray (Just (tL, tR, resState)) (map (\l -> (l, top, ps { psQualL = QualTop, psQualR = QualTop })) dsL), identL, False)
                    else Nothing
 
             (VArray mL dsL, VArray mR dsR) ->
@@ -291,16 +290,16 @@ stepValueStructure ps@ProductState{..} _ getQuals terminals cL cR sL sR =
                     (resState, canJoin) = getTargetState ps terminals getQuals cL cR tL tR
                     isNeutralL = isNeutral' tL
                     isNeutralR = isNeutral' tR
+                    isTermL = isTerminal' tL
+                    isTermR = isTerminal' tR
                 in if not canJoin then Nothing
                    else case psPolarity of
                     PJoin ->
                         let resDs = if length dsL == length dsR then zipWith (\l r -> (l, r, ps { psQualL = QualTop, psQualR = QualTop })) dsL dsR
-                                    else if null dsL && isNeutralL then map (\r -> (bot, r, ps { psQualL = QualTop, psQualR = QualTop })) dsR
-                                    else if null dsR && isNeutralR then map (\l -> (l, bot, ps { psQualL = QualTop, psQualR = QualTop })) dsL
                                     else []
                             resM = case (mL, mR) of { (Nothing, Nothing) -> Nothing; _ -> Just (tL, tR, resState) }
-                            identL = (tL == tR || isNeutralR || isNeutralL) && (length dsL == length dsR || (null dsL && isNeutralL))
-                            identR = (tR == tL || isNeutralL || isNeutralR) && (length dsL == length dsR || (null dsR && isNeutralR))
+                            identL = (tL == tR || isTermL || isNeutralR) && (length dsL == length dsR || null dsL)
+                            identR = (tR == tL || isTermR || isNeutralL) && (length dsL == length dsR || null dsR)
                         in Just (VArray resM resDs, identL, identR)
                     PMeet ->
                         let resDs = if null dsL then map (\r -> (top, r, ps { psQualL = QualTop, psQualR = QualTop })) dsR
@@ -308,8 +307,8 @@ stepValueStructure ps@ProductState{..} _ getQuals terminals cL cR sL sR =
                                     else if length dsL == length dsR then zipWith (\l r -> (l, r, ps { psQualL = QualTop, psQualR = QualTop })) dsL dsR
                                     else []
                             resM = case (mL, mR) of { (Nothing, Nothing) -> Nothing; _ -> Just (tL, tR, resState) }
-                            identL = (tL == tR || isNeutralR || isNeutralL) && (null dsL || length dsL == length dsR)
-                            identR = (tR == tL || isNeutralL || isNeutralR) && (null dsR || length dsL == length dsR)
+                            identL = (tL == tR || isTermL || isNeutralR) && (null dsR || length dsL == length dsR)
+                            identR = (tR == tL || isTermR || isNeutralL) && (null dsL || length dsL == length dsR)
                         in if null dsL || null dsR || length dsL == length dsR
                            then Just (VArray resM resDs, identL, identR)
                            else Nothing
@@ -319,7 +318,7 @@ stepValueStructure ps@ProductState{..} _ getQuals terminals cL cR sL sR =
                 let (resState, _) = getTargetState ps terminals getQuals cL cR bot tR
                 in case psPolarity of
                     PJoin -> Just (VPointer (bot, tR, resState) QNullable' oR, False, True)
-                    PMeet -> if allowCovariance psQualL && allowCovariance psQualR && nullR /= QNonnull'
+                    PMeet -> if allowCovariance psQualR && nullR /= QNonnull'
                              then Just (fmap (\x -> (x, x, ps)) vL, True, False)
                              else Nothing
 
@@ -327,7 +326,7 @@ stepValueStructure ps@ProductState{..} _ getQuals terminals cL cR sL sR =
                 let (resState, _) = getTargetState ps terminals getQuals cL cR tL bot
                 in case psPolarity of
                     PJoin -> Just (VPointer (tL, bot, resState) QNullable' oL, True, False)
-                    PMeet -> if allowCovariance psQualL && allowCovariance psQualR && nullL /= QNonnull'
+                    PMeet -> if allowCovariance psQualL && nullL /= QNonnull'
                              then Just (fmap (\x -> (x, x, ps)) vR, False, True)
                              else Nothing
 
@@ -335,15 +334,19 @@ stepValueStructure ps@ProductState{..} _ getQuals terminals cL cR sL sR =
                 let tR = fromMaybe bot mR
                     (resState, _) = getTargetState ps terminals getQuals cL cR bot tR
                 in case psPolarity of
-                    PJoin -> Just (VPointer (bot, tR, resState) QNullable' QNonOwned', False, True)
-                    PMeet -> Nothing
+                    PJoin -> Just (VPointer (bot, tR, resState) QNullable' QNonOwned', False, False)
+                    PMeet -> if allowCovariance psQualR
+                             then Just (fmap (\x -> (x, x, ps)) vL, True, False)
+                             else Nothing
 
             (VArray mL _, vR) | isNull vR ->
                 let tL = fromMaybe bot mL
                     (resState, _) = getTargetState ps terminals getQuals cL cR tL bot
                 in case psPolarity of
-                    PJoin -> Just (VPointer (tL, bot, resState) QNullable' QNonOwned', True, False)
-                    PMeet -> Nothing
+                    PJoin -> Just (VPointer (tL, bot, resState) QNullable' QNonOwned', False, False)
+                    PMeet -> if allowCovariance psQualL
+                             then Just (fmap (\x -> (x, x, ps)) vR, False, True)
+                             else Nothing
 
             -- Identical non-standard constructors (TypeRef, External, etc.)
             (l, r) | void l == void r ->
