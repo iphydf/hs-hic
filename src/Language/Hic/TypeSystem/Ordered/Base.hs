@@ -6,6 +6,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms   #-}
 {-# LANGUAGE RecordWildCards   #-}
+{-# LANGUAGE StrictData        #-}
 {-# LANGUAGE TupleSections     #-}
 {-# OPTIONS_GHC -Wno-unused-top-binds #-}
 module Language.Hic.TypeSystem.Ordered.Base
@@ -35,6 +36,7 @@ import           Data.Fix                                             (Fix (..),
 import           Data.List                                            (find,
                                                                        foldl',
                                                                        nub)
+import qualified Data.IntMap.Strict                                    as IntMap
 import           Data.Map.Strict                                      (Map)
 import qualified Data.Map.Strict                                      as Map
 import           Data.Maybe                                           (fromMaybe,
@@ -118,14 +120,14 @@ instance ToJSON OrderedSolverResult
 
 data SolverState = SolverState
     { ssBindings      :: Map (FullTemplate 'Local) (TypeInfo 'Local, Provenance 'Local)
-    , ssBindingsIndex :: Map (TemplateId 'Local) [FullTemplate 'Local]
+    , ssBindingsIndex :: Map (TemplateId 'Local) (Set (FullTemplate 'Local))
     , ssErrors        :: [ErrorInfo 'Local]
     , ssTypeSystem    :: TypeSystem
     , ssArrayUsage    :: ArrayUsageResult
     , ssInferred      :: Map Text (TypeInfo 'Local)
     , ssInvariants    :: InvariantResult
-    , ssFuncPhases    :: Map Text Integer
-    , ssActivePhases  :: Set Integer
+    , ssFuncPhases    :: Map Text Int
+    , ssActivePhases  :: Set Int
     , ssNextId        :: Int
     , ssFinalPass     :: Bool
     , ssResolvedKeys  :: Set (FullTemplate 'Local)
@@ -138,7 +140,7 @@ runOrderedSolver _ aur ir sccs cgr =
     let ts = irTypeSystem ir
         initialState = SolverState Map.empty Map.empty [] ts aur Map.empty ir (cgrFuncPhases cgr) Set.empty 0 True Set.empty
         finalState = execState (mapM_ (solveScc (cgrConstraints cgr)) sccs) initialState
-    in OrderedSolverResult (ssErrors finalState) (ssInferred finalState)
+    in OrderedSolverResult (reverse $ ssErrors finalState) (ssInferred finalState)
 
 solveScc :: Map Text [Constraint 'Local] -> SccType -> Solver ()
 solveScc constrMap scc = do
@@ -253,13 +255,13 @@ solveConstraint c = do
             Subtype actual expected loc ctx reason -> void $ U.subtype actual expected reason loc ctx
             _ -> return ()
 
-    let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) Set.empty (ssNextId st) (ssFinalPass st)
+    let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
     let finalUnifyState = execState action initialState
 
     State.modify $ \s -> s
         { ssBindings = U.usBindings finalUnifyState
         , ssBindingsIndex = U.usBindingsIndex finalUnifyState
-        , ssErrors = if ssFinalPass st then ssErrors s ++ U.usErrors finalUnifyState else ssErrors s
+        , ssErrors = if ssFinalPass st then U.usErrors finalUnifyState ++ ssErrors s else ssErrors s
         , ssNextId = U.usNextId finalUnifyState
         }
 
@@ -272,10 +274,10 @@ solveConstraint c = do
             solveCoordinatedPair trigger actual expected loc ctx mCsId
         _ -> return ()
 
-solveCoordinatedPair :: TypeInfo 'Local -> TypeInfo 'Local -> TypeInfo 'Local -> Maybe (Lexeme Text) -> [Context 'Local] -> Maybe Integer -> Solver ()
+solveCoordinatedPair :: TypeInfo 'Local -> TypeInfo 'Local -> TypeInfo 'Local -> Maybe (Lexeme Text) -> [Context 'Local] -> Maybe Int -> Solver ()
 solveCoordinatedPair trigger actual expected loc ctx mCsId = do
     st <- State.get
-    let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) Set.empty (ssNextId st) (ssFinalPass st)
+    let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
     let tr = evalState (U.resolveType =<< U.applyBindings trigger) initialState
     let ft = TS.toFlat tr
     dtraceM $ "solveCoordinatedPair trigger=" ++ show tr ++ " quals=" ++ show (TS.ftQuals ft)
@@ -286,7 +288,7 @@ solveCoordinatedPair trigger actual expected loc ctx mCsId = do
             State.modify $ \s -> s
                 { ssBindings = U.usBindings finalUnifyState
                 , ssBindingsIndex = U.usBindingsIndex finalUnifyState
-                , ssErrors = ssErrors s ++ U.usErrors finalUnifyState
+                , ssErrors = U.usErrors finalUnifyState ++ ssErrors s
                 , ssNextId = U.usNextId finalUnifyState
                 }
         else return ()
@@ -321,12 +323,12 @@ solveMemberAccess t field mt reason ml ctx = do
                             let mty' = TS.instantiate 0 (TS.Source name) argMap mty
                             let mty'' = maybe mty' (`Spec.specializeType` mty') mIdx
                             st <- State.get
-                            let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) Set.empty (ssNextId st) (ssFinalPass st)
+                            let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
                             let finalUnifyState = execState (U.unify mty'' mt reason ml ctx) initialState
                             State.modify $ \s -> s
                                 { ssBindings = U.usBindings finalUnifyState
                                 , ssBindingsIndex = U.usBindingsIndex finalUnifyState
-                                , ssErrors = ssErrors s ++ U.usErrors finalUnifyState
+                                , ssErrors = U.usErrors finalUnifyState ++ ssErrors s
                                 , ssNextId = U.usNextId finalUnifyState
                                 }
 
@@ -356,7 +358,7 @@ bind tid index ty reason ml ctx = do
                         _ -> do
                             let prov = FromContext (ErrorInfo ml ctx (TypeMismatch (Template tid' index') ty reason Nothing) [])
                             State.modify $ \s -> s { ssBindings = Map.insert k (ty, prov) (ssBindings s)
-                                                   , ssBindingsIndex = Map.insertWith (++) tid' [k] (ssBindingsIndex s) }
+                                                   , ssBindingsIndex = Map.insertWith Set.union tid' (Set.singleton k) (ssBindingsIndex s) }
         _ -> solveConstraint (Equality rep ty ml ctx reason)
 
 occurs :: TemplateId p -> Maybe (TypeInfo p) -> TypeInfo p -> Bool
@@ -417,7 +419,7 @@ substBindings bindings = foldFix $ \case
 resolveType :: TypeInfo 'Local -> Solver (TypeInfo 'Local)
 resolveType ty = do
     st <- State.get
-    let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) Set.empty (ssNextId st) (ssFinalPass st)
+    let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
     return $ evalState (U.resolveType ty) initialState
 
 reportError :: Maybe (Lexeme Text) -> [Context 'Local] -> TypeError 'Local -> Solver ()
@@ -429,11 +431,11 @@ reportError ml ctx err = do
                 TypeMismatch expected actual _ _ -> expected : actual : concatMap getContextTypes ctx
                 _ -> concatMap getContextTypes ctx
         let expls = concatMap (P.explainType bindings) allTypes
-        State.modify $ \s -> s { ssErrors = ssErrors s ++ [ErrorInfo ml ctx err (P.dedupDocs expls)] }
+        State.modify $ \s -> s { ssErrors = ErrorInfo ml ctx err (P.dedupDocs expls) : ssErrors s }
   where
     getContextTypes = \case { InUnification e a _ -> [e, a]; _ -> [] }
 
-solveCallable :: TypeInfo 'Local -> [TypeInfo 'Local] -> TypeInfo 'Local -> MismatchReason -> Maybe (Lexeme Text) -> [Context 'Local] -> Maybe Integer -> Bool -> Solver ()
+solveCallable :: TypeInfo 'Local -> [TypeInfo 'Local] -> TypeInfo 'Local -> MismatchReason -> Maybe (Lexeme Text) -> [Context 'Local] -> Maybe Int -> Bool -> Solver ()
 solveCallable ft atys rt reason ml ctx mCsId shouldRefresh = do
     ft' <- case ft of
         TypeRef TS.FuncRef (L _ _ tid) _ -> do
@@ -479,7 +481,7 @@ solveCallable ft atys rt reason ml ctx mCsId shouldRefresh = do
                 nExpected = length expectedParams
                 nActual = length atys
             st <- State.get
-            let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) Set.empty (ssNextId st) (ssFinalPass st)
+            let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
             let action = do
                     void $ U.unify ret rt reason ml ctx
                     if isVariadic then
@@ -493,7 +495,7 @@ solveCallable ft atys rt reason ml ctx mCsId shouldRefresh = do
             State.modify $ \s -> s
                 { ssBindings = U.usBindings finalUnifyState
                 , ssBindingsIndex = U.usBindingsIndex finalUnifyState
-                , ssErrors = ssErrors s ++ U.usErrors finalUnifyState
+                , ssErrors = U.usErrors finalUnifyState ++ ssErrors s
                 , ssNextId = U.usNextId finalUnifyState
                 }
         Template tid i -> do
@@ -524,7 +526,7 @@ deVoidify = snd . foldFix alg
             return $ Pointer (applyWrappers orig tp)
         _ -> Fix <$> traverse snd f)
 
-refreshTemplates :: Maybe Integer -> TypeInfo 'Local -> Solver (TypeInfo 'Local)
+refreshTemplates :: Maybe Int -> TypeInfo 'Local -> Solver (TypeInfo 'Local)
 refreshTemplates mCsId ty = State.evalStateT (snd (foldFix alg ty)) Map.empty
   where
     alg f = (Fix (fmap fst f), do

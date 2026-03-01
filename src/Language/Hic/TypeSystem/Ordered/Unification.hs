@@ -3,6 +3,7 @@
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms   #-}
+{-# LANGUAGE StrictData        #-}
 module Language.Hic.TypeSystem.Ordered.Unification
     ( UnifyResult (..)
     , UnifyState (..)
@@ -25,9 +26,13 @@ import           Control.Monad                              (foldM, forM_,
 import           Control.Monad.State.Strict                 (State, StateT,
                                                              execState, lift)
 import qualified Control.Monad.State.Strict                 as State
+import           Data.Bits                                  (xor)
 import           Data.Fix                                   (Fix (..), foldFix,
                                                              foldFixM, unFix)
 import qualified Data.Graph                                 as Graph
+import           Data.List                                  (foldl')
+import           Data.IntMap.Strict                         (IntMap)
+import qualified Data.IntMap.Strict                         as IntMap
 import           Data.Map.Strict                            (Map)
 import qualified Data.Map.Strict                            as Map
 import           Data.Maybe                                 (catMaybes,
@@ -114,10 +119,10 @@ data UnifyResult = UnifyResult
 
 data UnifyState = UnifyState
     { usBindings      :: Map (FullTemplate 'Local) (TypeInfo 'Local, Provenance 'Local)
-    , usBindingsIndex :: Map (TemplateId 'Local) [FullTemplate 'Local]
+    , usBindingsIndex :: Map (TemplateId 'Local) (Set (FullTemplate 'Local))
     , usErrors        :: [ErrorInfo 'Local]
     , usTypeSystem    :: TypeSystem
-    , usSeen          :: Set (TypeInfo 'Local, TypeInfo 'Local, QualState)
+    , usSeen          :: IntMap (Set (TypeInfo 'Local, TypeInfo 'Local, QualState))
     , usNextId        :: Int
     , usFinalPass     :: Bool
     }
@@ -126,12 +131,12 @@ type Unify = State UnifyState
 
 runUnification :: TypeSystem -> Unify a -> UnifyResult
 runUnification ts action =
-    let initialState = UnifyState Map.empty Map.empty [] ts Set.empty 0 True
+    let initialState = UnifyState Map.empty Map.empty [] ts IntMap.empty 0 True
         finalState = execState action initialState
     in UnifyResult (usErrors finalState) (usBindings finalState)
 
-buildBindingsIndex :: Map (FullTemplate 'Local) a -> Map (TemplateId 'Local) [FullTemplate 'Local]
-buildBindingsIndex = Map.foldlWithKey' (\acc ft _ -> Map.insertWith (++) (ftId ft) [ft] acc) Map.empty
+buildBindingsIndex :: Map (FullTemplate 'Local) a -> Map (TemplateId 'Local) (Set (FullTemplate 'Local))
+buildBindingsIndex = Map.foldlWithKey' (\acc ft _ -> Map.insertWith Set.union (ftId ft) (Set.singleton ft) acc) Map.empty
 
 unify :: TypeInfo 'Local -> TypeInfo 'Local -> MismatchReason -> Maybe (Lexeme Text) -> [Context 'Local] -> Unify (Maybe (MismatchDetail 'Local))
 unify = unifyRecursive QualTop
@@ -148,17 +153,17 @@ subtype actual expected reason ml ctx = subtypeRecursive QualTop actual expected
 
 subtypeRecursive :: QualState -> TypeInfo 'Local -> TypeInfo 'Local -> MismatchReason -> Maybe (Lexeme Text) -> [Context 'Local] -> Unify (Maybe (MismatchDetail 'Local))
 subtypeRecursive qstate actual expected reason ml ctx = do
-    ab0 <- resolveType =<< applyBindings actual
-    eb0 <- resolveType =<< applyBindings expected
-    ab1 <- deVoidify ab0
-    eb1 <- deVoidify eb0
+    ab1 <- resolveAndDeVoidify =<< applyBindings actual
+    eb1 <- resolveAndDeVoidify =<< applyBindings expected
 
     dtraceM $ "SUBTYPE(" ++ show qstate ++ "): " ++ show ab1 ++ " <: " ++ show eb1
     seen <- State.gets usSeen
-    if Set.member (ab1, eb1, qstate) seen
+    let key = (ab1, eb1, qstate)
+        h = hashSeenKey key
+    if seenMember h key seen
         then dtraceM "  ALREADY SEEN" >> return Nothing
         else do
-            State.modify $ \s -> s { usSeen = Set.insert (ab1, eb1, qstate) (usSeen s) }
+            State.modify $ \s -> s { usSeen = seenInsert h key (usSeen s) }
             res <- subtypeImpl qstate ab1 eb1 reason ml ctx
             State.modify $ \s -> s { usSeen = seen }
             return res
@@ -184,6 +189,70 @@ deVoidify = foldFixM alg
     applyWrappers (Var l t) x            = Var l (applyWrappers t x)
     applyWrappers (Sized t l) x          = Sized (applyWrappers t x) l
     applyWrappers _ x                    = x
+
+-- | Bucketed seen-set operations for cycle detection.
+-- Uses a cheap structural hash to avoid full tree comparisons on every lookup.
+type SeenKey = (TypeInfo 'Local, TypeInfo 'Local, QualState)
+type SeenMap = IntMap (Set SeenKey)
+
+hashSeenKey :: SeenKey -> Int
+hashSeenKey (t1, t2, qs) = hashTypeInfo t1 `xor` (hashTypeInfo t2 * 31) `xor` fromEnum qs
+
+seenMember :: Int -> SeenKey -> SeenMap -> Bool
+seenMember h k m = case IntMap.lookup h m of
+    Nothing -> False
+    Just s  -> Set.member k s
+
+seenInsert :: Int -> SeenKey -> SeenMap -> SeenMap
+seenInsert h k = IntMap.insertWith Set.union h (Set.singleton k)
+
+-- | Cheap structural hash of a type tree.  Only examines constructor tags
+-- and key discriminants (type names, template IDs) to produce a hash that
+-- distributes well enough for bucket-based lookup.
+hashTypeInfo :: TypeInfo 'Local -> Int
+hashTypeInfo = foldFix $ \case
+    TypeRefF _ (L _ _ tid) hs       -> combine 1 (hashTid tid) `combineList` hs
+    PointerF h                      -> combine 2 h
+    SizedF h _                      -> combine 3 h
+    QualifiedF _ h                  -> combine 4 h
+    BuiltinTypeF bt                 -> combine 5 (hashStdType bt)
+    ExternalTypeF (L _ _ tid)       -> combine 6 (hashTid tid)
+    ArrayF mh _                     -> combine 7 (maybe 0 id mh)
+    VarF _ h                        -> combine 8 h
+    FunctionF rh phs                -> combine 9 rh `combineList` phs
+    TemplateF (FullTemplate tid mi) -> combine 10 (hashTid tid + maybe 0 (* 17) mi)
+    SingletonF bt v                 -> combine 11 (hashStdType bt) `xor` fromInteger v
+    VarArgF                         -> 12
+    UnconstrainedF                  -> 13
+    ConflictF                       -> 14
+    IntLitF (L _ _ tid)             -> combine 15 (hashTid tid)
+    NameLitF (L _ _ tid)            -> combine 16 (hashTid tid)
+    EnumMemF (L _ _ tid)            -> combine 17 (hashTid tid)
+    ProxyF h                        -> combine 18 h
+    UnsupportedF _                  -> 19
+  where
+    combine tag h = tag * 1000003 + h
+    combineList h hs = foldl' (\acc x -> acc * 31 + x) h hs
+    hashTid :: TemplateId 'Local -> Int
+    hashTid = \case
+        TIdInst n t       -> combine 1 n `xor` hashGlobalTid t
+        TIdPoly n i _ _   -> combine 2 (n + i)
+        TIdSolver i _     -> combine 3 i
+        TIdAnonymous i _  -> combine 4 i
+        TIdRec i          -> combine 5 i
+    hashGlobalTid :: TemplateId 'Global -> Int
+    hashGlobalTid = \case
+        TIdName t         -> combine 6 (T.length t)
+        TIdParam i _ _    -> combine 7 i
+        TIdAnonymous i _  -> combine 8 i
+        TIdRec i          -> combine 9 i
+    hashStdType :: StdType -> Int
+    hashStdType = \case
+        VoidTy    -> 0;  BoolTy    -> 1;  CharTy   -> 2
+        U08Ty     -> 3;  S08Ty     -> 4;  U16Ty    -> 5
+        S16Ty     -> 6;  U32Ty     -> 7;  S32Ty    -> 8
+        U64Ty     -> 9;  S64Ty     -> 10; SizeTy   -> 11
+        F32Ty     -> 12; F64Ty     -> 13; NullPtrTy -> 14
 
 nextSolverTemplate :: Maybe Text -> Unify (TypeInfo 'Local)
 nextSolverTemplate mHint = do
@@ -455,7 +524,7 @@ bind tid index ty reason ml ctx = do
             let k = FullTemplate tid' index'
 
             -- Conflict check across exact/compatible matches using secondary index.
-            let related = Map.findWithDefault [] tid' (usBindingsIndex s)
+            let related = Map.findWithDefault Set.empty tid' (usBindingsIndex s)
             forM_ related $ \ft@(FullTemplate _ index'') ->
                 case Map.lookup ft bindings of
                     Just (existing, _) ->
@@ -476,13 +545,13 @@ bind tid index ty reason ml ctx = do
                             let prov = FromContext (ErrorInfo ml ctx (TypeMismatch (Template tid' index') ty reason Nothing) [])
                             dtraceM $ "  BIND (Occurs): " ++ show (Template tid' index') ++ " -> " ++ show ty
                             State.modify $ \s' -> s' { usBindings = Map.insert k (ty, prov) (usBindings s')
-                                                     , usBindingsIndex = Map.insertWith (++) tid' [k] (usBindingsIndex s') }
+                                                     , usBindingsIndex = Map.insertWith Set.union tid' (Set.singleton k) (usBindingsIndex s') }
                         Unsupported _ -> return ()
                         _ -> do
                             let prov = FromContext (ErrorInfo ml ctx (TypeMismatch (Template tid' index') ty reason Nothing) [])
                             dtraceM $ "  BIND: " ++ show (Template tid' index') ++ " -> " ++ show ty
                             State.modify $ \s' -> s' { usBindings = Map.insert k (ty, prov) (usBindings s')
-                                                     , usBindingsIndex = Map.insertWith (++) tid' [k] (usBindingsIndex s') }
+                                                     , usBindingsIndex = Map.insertWith Set.union tid' (Set.singleton k) (usBindingsIndex s') }
         _ -> void $ unify rep ty reason ml ctx
 
 
@@ -524,17 +593,75 @@ applyBindingsDeep ty = do
         maybe (Template tid i) TG.toTypeInfo (Map.lookup (FullTemplate tid i) m)
     alg _ f = Fix f
 
-resolveType :: TypeInfo 'Local -> Unify (TypeInfo 'Local)
-resolveType ty = do
+-- | Resolves type aliases AND deVoidifies void pointers in a single tree walk.
+-- Combines two previously separate passes to halve tree traversal overhead.
+resolveAndDeVoidify :: TypeInfo 'Local -> Unify (TypeInfo 'Local)
+resolveAndDeVoidify ty = do
     ts <- State.gets usTypeSystem
-    return $ go ts Set.empty ty
+    go ts Set.empty ty
   where
     go ts seen (TypeRef ref l@(L _ _ tid) args) =
         let name = TS.templateIdBaseName tid in
         if Set.member name seen
-        then TypeRef ref l (map (go ts seen) args)
+        then do
+            args' <- mapM (go ts seen) args
+            return $ TypeRef ref l args'
         else case TS.lookupType name ts of
-            Nothing -> TypeRef ref l (map (go ts seen) args)
+            Nothing -> do
+                args' <- mapM (go ts seen) args
+                return $ TypeRef ref l args'
+            Just descr ->
+                let tps = TS.getDescrTemplates descr
+                    argsV = if null args && not (null tps)
+                            then [ TS.instantiate 0 TS.TopLevel (Map.fromList (zip tps args)) (TS.Template t Nothing) | t <- tps ]
+                            else args
+                    descr' = TS.instantiateDescr 0 TS.TopLevel (Map.fromList (zip tps argsV)) descr
+                in case descr' of
+                    AliasDescr _ _ target ->
+                        go ts (Set.insert name seen) target
+                    FuncDescr _ _ ret params ->
+                        go ts (Set.insert name seen) (Function ret params)
+                    _ -> do
+                        let ref' = case descr' of
+                                     StructDescr{} -> TS.StructRef
+                                     UnionDescr{}  -> TS.UnionRef
+                                     EnumDescr{}   -> TS.EnumRef
+                                     _             -> TS.IntRef
+                        argsV' <- mapM (go ts seen) argsV
+                        return $ TypeRef ref' (TS.getDescrLexeme descr') argsV'
+    go ts seen (Fix (TS.VarF _ inner)) = go ts seen inner
+    go ts seen (Fix (PointerF inner)) = do
+        inner' <- go ts seen inner
+        if TS.isVoid inner' then do
+            tid <- nextSolverTemplate Nothing
+            return $ dvApplyWrappers inner' (Pointer tid)
+        else return $ Pointer inner'
+    go ts seen (Fix f) = do
+        f' <- traverse (go ts seen) f
+        return $ Fix f'
+
+    dvApplyWrappers (BuiltinType VoidTy) x = x
+    dvApplyWrappers (Const t) x            = Const (dvApplyWrappers t x)
+    dvApplyWrappers (Owner t) x            = Owner (dvApplyWrappers t x)
+    dvApplyWrappers (Nonnull t) x          = Nonnull (dvApplyWrappers t x)
+    dvApplyWrappers (Nullable t) x         = Nullable (dvApplyWrappers t x)
+    dvApplyWrappers (Qualified qs t) x     = Qualified qs (dvApplyWrappers t x)
+    dvApplyWrappers (Var l t) x            = Var l (dvApplyWrappers t x)
+    dvApplyWrappers (Sized t l) x          = Sized (dvApplyWrappers t x) l
+    dvApplyWrappers _ x                    = x
+
+-- | Pure resolveType (for callers that don't need deVoidify).
+resolveType :: TypeInfo 'Local -> Unify (TypeInfo 'Local)
+resolveType ty = do
+    ts <- State.gets usTypeSystem
+    return $ goRT ts Set.empty ty
+  where
+    goRT ts seen (TypeRef ref l@(L _ _ tid) args) =
+        let name = TS.templateIdBaseName tid in
+        if Set.member name seen
+        then TypeRef ref l (map (goRT ts seen) args)
+        else case TS.lookupType name ts of
+            Nothing -> TypeRef ref l (map (goRT ts seen) args)
             Just descr ->
                 let tps = TS.getDescrTemplates descr
                     args' = if null args && not (null tps)
@@ -543,18 +670,18 @@ resolveType ty = do
                     descr' = TS.instantiateDescr 0 TS.TopLevel (Map.fromList (zip tps args')) descr
                 in case descr' of
                     AliasDescr _ _ target ->
-                        go ts (Set.insert name seen) target
+                        goRT ts (Set.insert name seen) target
                     FuncDescr _ _ ret params ->
-                        go ts (Set.insert name seen) (Function ret params)
+                        goRT ts (Set.insert name seen) (Function ret params)
                     _ ->
                         let ref' = case descr' of
                                      StructDescr{} -> TS.StructRef
                                      UnionDescr{}  -> TS.UnionRef
                                      EnumDescr{}   -> TS.EnumRef
                                      _             -> TS.IntRef
-                        in TypeRef ref' (TS.getDescrLexeme descr') (map (go ts seen) args')
-    go ts seen (Fix (TS.VarF _ inner)) = go ts seen inner
-    go ts seen (Fix f) = Fix (fmap (go ts seen) f)
+                        in TypeRef ref' (TS.getDescrLexeme descr') (map (goRT ts seen) args')
+    goRT ts seen (Fix (TS.VarF _ inner)) = goRT ts seen inner
+    goRT ts seen (Fix f) = Fix (fmap (goRT ts seen) f)
 
 reportError :: Maybe (Lexeme Text) -> [Context 'Local] -> TypeError 'Local -> Unify ()
 reportError ml ctx err = do
@@ -566,7 +693,7 @@ reportError ml ctx err = do
                 TypeMismatch expected actual _ _ -> expected : actual : concatMap getContextTypes ctx
                 _ -> concatMap getContextTypes ctx
         let expls = concatMap (P.explainType bindings) allTypes
-        State.modify $ \s -> s { usErrors = usErrors s ++ [ErrorInfo ml ctx err (P.dedupDocs expls)] }
+        State.modify $ \s -> s { usErrors = ErrorInfo ml ctx err (P.dedupDocs expls) : usErrors s }
   where
     getContextTypes = \case
         InUnification e a _ -> [e, a]

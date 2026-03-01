@@ -178,8 +178,8 @@ instance Arbitrary Origin where
 data TemplateId (p :: Phase) where
     TIdName      :: Text -> TemplateId 'Global        -- ^ Original name from source (e.g. "T")
     TIdParam     :: Int -> Maybe Text -> Origin -> TemplateId 'Global -- ^ Generalized parameter (P0, P1, ...)
-    TIdInst      :: Integer -> TemplateId 'Global -> TemplateId 'Local -- ^ Instantiated at a specific call site ID
-    TIdPoly      :: Integer -> Int -> Maybe Text -> Origin -> TemplateId 'Local -- ^ Generalized parameter scoped to a phase
+    TIdInst      :: Int -> TemplateId 'Global -> TemplateId 'Local -- ^ Instantiated at a specific call site ID
+    TIdPoly      :: Int -> Int -> Maybe Text -> Origin -> TemplateId 'Local -- ^ Generalized parameter scoped to a phase
     TIdSolver    :: Int -> Maybe Text -> TemplateId 'Local -- ^ Temporary solver template with an optional hint
     TIdAnonymous :: Int -> Maybe Text -> TemplateId p        -- ^ Anonymous template (e.g. from void*)
     TIdRec       :: Int -> TemplateId p               -- ^ Recursion point for equi-recursive types

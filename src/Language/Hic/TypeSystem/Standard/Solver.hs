@@ -161,7 +161,7 @@ nextTemplate mHint = do
     State.modify $ \s -> s { ssNextId = i + 1 }
     return $ Template (TIdSolver i mHint) Nothing
 
-refreshTemplates :: Maybe Integer -> TypeInfo 'Local -> Solver (TypeInfo 'Local)
+refreshTemplates :: Maybe Int -> TypeInfo 'Local -> Solver (TypeInfo 'Local)
 refreshTemplates mCsId ty = State.evalStateT (snd (foldFix alg ty)) Map.empty
   where
     alg :: TypeInfoF (TemplateId 'Local) (TypeInfo 'Local, StateT (Map (FullTemplate 'Local) (TypeInfo 'Local)) Solver (TypeInfo 'Local)) -> (TypeInfo 'Local, StateT (Map (FullTemplate 'Local) (TypeInfo 'Local)) Solver (TypeInfo 'Local))
@@ -502,7 +502,7 @@ reportError ml ctx err = do
         InUnification e a _ -> [e, a]
         _ -> []
 
-checkCallable :: TypeInfo 'Local -> [TypeInfo 'Local] -> Maybe (Lexeme Text) -> [Context 'Local] -> Maybe Integer -> Bool -> Solver ()
+checkCallable :: TypeInfo 'Local -> [TypeInfo 'Local] -> Maybe (Lexeme Text) -> [Context 'Local] -> Maybe Int -> Bool -> Solver ()
 checkCallable t args ml ctx mCsId shouldRefresh = do
     rt <- resolveType =<< applyBindings t
     -- Refresh templates for all callables to allow polymorphism

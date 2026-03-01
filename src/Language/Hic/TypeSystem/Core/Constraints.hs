@@ -34,11 +34,11 @@ data Constraint (p :: Phase)
     -- ^ The first type (actual) must be a subtype of the second (expected).
     | Lub (TypeInfo p) [TypeInfo p] (Maybe (Lexeme Text)) [Context p] MismatchReason
     -- ^ The first type is the Least Upper Bound (LUB) of the given list of types.
-    | Callable (TypeInfo p) [TypeInfo p] (TypeInfo p) (Maybe (Lexeme Text)) [Context p] (Maybe Integer) Bool
+    | Callable (TypeInfo p) [TypeInfo p] (TypeInfo p) (Maybe (Lexeme Text)) [Context p] (Maybe Int) Bool
     -- ^ Represents a function call. Params: FunctionType, ArgTypes, ReturnType, Location, Context, CallSiteId, ShouldRefresh.
     | HasMember (TypeInfo p) Text (TypeInfo p) (Maybe (Lexeme Text)) [Context p] MismatchReason
     -- ^ Represents a struct/union member access. Params: BaseType, MemberName, ResultType, Location, Context, Reason.
-    | CoordinatedPair (TypeInfo p) (TypeInfo p) (TypeInfo p) (Maybe (Lexeme Text)) [Context p] (Maybe Integer)
+    | CoordinatedPair (TypeInfo p) (TypeInfo p) (TypeInfo p) (Maybe (Lexeme Text)) [Context p] (Maybe Int)
     -- ^ Conditional constraint: If the first type (trigger) is Nonnull,
     -- then the second (actual) must be a subtype of the third (expected).
     deriving (Show, Eq, Ord, Generic)

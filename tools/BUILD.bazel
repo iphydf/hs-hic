@@ -3,6 +3,7 @@ load("@rules_haskell//haskell:defs.bzl", "haskell_binary")
 haskell_binary(
     name = "hic-check",
     srcs = ["hic-check.hs"],
+    ghcopts = ["-rtsopts", "-with-rtsopts=-A64m"],
     tags = [
         "haskell",
         "no-cross",

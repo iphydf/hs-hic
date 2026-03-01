@@ -104,7 +104,7 @@ resolveCallableG ts bindings ty =
 -- | Solves a list of constraints for a given set of templates.
 -- Uses SCC-based graph reduction to find the least specific
 -- types that satisfy all constraints.
-solveConstraints :: TypeSystem -> Set Integer -> Map (FullTemplate 'Local) (TypeInfo 'Local) -> [Constraint 'Local] -> Map (FullTemplate 'Local) (TypeInfo 'Local)
+solveConstraints :: TypeSystem -> Set Int -> Map (FullTemplate 'Local) (TypeInfo 'Local) -> [Constraint 'Local] -> Map (FullTemplate 'Local) (TypeInfo 'Local)
 solveConstraints ts activePhases initialBindingsMap constraints =
     let initialBindingsG = Map.map TG.fromTypeInfo initialBindingsMap
         -- Pass 1: Structural constraints
@@ -158,8 +158,8 @@ solveConstraints ts activePhases initialBindingsMap constraints =
                             let tid = TS.ftId ft
                                 baseIdx = case tid of
                                     TIdSolver idx _    -> idx * 100
-                                    TIdPoly ph idx _ _ -> fromIntegral ph * 1000 + idx * 100
-                                    TIdInst idx _      -> fromIntegral idx * 100
+                                    TIdPoly ph idx _ _ -> ph * 1000 + idx * 100
+                                    TIdInst idx _      -> idx * 100
                                     _                  -> 0
                                 mkT j h = Fix (TemplateF (FullTemplate (TIdSolver (baseIdx + j) (Just h)) Nothing))
                                 retT = mkT 99 "ret"
@@ -357,13 +357,13 @@ isTemplate :: TypeInfo p -> Bool
 isTemplate (Fix (TemplateF _)) = True
 isTemplate _                   = False
 
-refreshTemplates :: Set Integer -> Maybe Integer -> TypeInfo 'Local -> Map (FullTemplate 'Local) (TypeInfo 'Local) -> TypeInfo 'Local
+refreshTemplates :: Set Int -> Maybe Int -> TypeInfo 'Local -> Map (FullTemplate 'Local) (TypeInfo 'Local) -> TypeInfo 'Local
 refreshTemplates activePhases mCsId ty bindings =
     case mCsId of
         Just csId -> foldFix (alg csId) ty
         Nothing   -> ty
   where
-    alg :: Integer -> TypeInfoF (TemplateId 'Local) (TypeInfo 'Local) -> TypeInfo 'Local
+    alg :: Int -> TypeInfoF (TemplateId 'Local) (TypeInfo 'Local) -> TypeInfo 'Local
     alg csId f = case f of
         TemplateF (FullTemplate tid mIdx) ->
             case tid of
@@ -391,7 +391,7 @@ applyBindings bindings ty = go Set.empty ty
 
 -- | Verifies that all constraints are satisfied by the given bindings.
 -- Returns a list of errors for unsatisfied constraints.
-verifyConstraints :: TypeSystem -> Set Integer -> Map (FullTemplate 'Local) (TypeInfo 'Local) -> [Constraint 'Local] -> [ErrorInfo 'Local]
+verifyConstraints :: TypeSystem -> Set Int -> Map (FullTemplate 'Local) (TypeInfo 'Local) -> [Constraint 'Local] -> [ErrorInfo 'Local]
 verifyConstraints ts activePhases bindings constraints =
     concatMap verify constraints
   where

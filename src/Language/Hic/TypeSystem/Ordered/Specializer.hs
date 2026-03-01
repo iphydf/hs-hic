@@ -79,5 +79,5 @@ toGlobalConstraint :: Constraint 'Local -> Constraint 'Global
 toGlobalConstraint = mapTypesPhase TS.toGlobal
 
 -- | Convert a Global constraint to a Local one.
-toLocalConstraint :: Integer -> TS.Origin -> Constraint 'Global -> Constraint 'Local
+toLocalConstraint :: Int -> TS.Origin -> Constraint 'Global -> Constraint 'Local
 toLocalConstraint ph parent = mapTypesPhase (TS.toLocal ph parent)

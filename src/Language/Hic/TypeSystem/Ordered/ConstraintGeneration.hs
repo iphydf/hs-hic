@@ -96,7 +96,7 @@ dtraceM msg = if debugging then Debug.traceM msg else return ()
 data ConstraintGenResult = ConstraintGenResult
     { cgrConstraints :: Map Text [Constraint 'Local] -- FunctionName -> [Constraint]
     , cgrDiagnostics :: [Text]               -- Unhandled nodes or other issues
-    , cgrFuncPhases  :: Map Text Integer      -- FunctionName -> PhaseId
+    , cgrFuncPhases  :: Map Text Int           -- FunctionName -> PhaseId
     } deriving (Show, Generic)
 
 instance ToJSON ConstraintGenResult
@@ -107,9 +107,9 @@ data ExtractionState = ExtractionState
     , esTypeSystem  :: TypeSystem
     , esContext     :: [Context 'Local]
     , esNextId      :: Int
-    , esCallSiteId  :: Integer
-    , esPhaseId     :: Integer
-    , esFuncPhases  :: Map Text Integer
+    , esCallSiteId  :: Int
+    , esPhaseId     :: Int
+    , esFuncPhases  :: Map Text Int
     , esReturnType  :: Maybe (TypeInfo 'Local)
     , esGlobals     :: Set Text
     , esArrayUsage  :: ArrayUsageResult
@@ -166,7 +166,7 @@ nextTemplate mHint = do
     dtraceM $ "nextTemplate: " ++ show res
     return res
 
-nextPhaseId :: Extract Integer
+nextPhaseId :: Extract Int
 nextPhaseId = do
     ph <- State.gets esPhaseId
     State.modify $ \s -> s { esPhaseId = ph + 1 }

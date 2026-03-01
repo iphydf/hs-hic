@@ -84,7 +84,7 @@ dtraceM msg = if debugging then Debug.traceM msg else return ()
 data Constraint (p :: Phase)
     = Equality (TypeInfo p) (TypeInfo p) (Maybe (Lexeme Text)) [Context p] MismatchReason
     | Subtype (TypeInfo p) (TypeInfo p) (Maybe (Lexeme Text)) [Context p] MismatchReason
-    | Callable (TypeInfo p) [TypeInfo p] (Maybe (Lexeme Text)) [Context p] (Maybe Integer) Bool
+    | Callable (TypeInfo p) [TypeInfo p] (Maybe (Lexeme Text)) [Context p] (Maybe Int) Bool
     | HasMember (TypeInfo p) Text (TypeInfo p) (Maybe (Lexeme Text)) [Context p] MismatchReason
     | CoordinatedPair (TypeInfo p) (TypeInfo p) (TypeInfo p) (Maybe (Lexeme Text)) [Context p]
     -- ^ If the first TypeInfo (the trigger) is Nonnull, then the second (actual) must be a subtype of the third (expected).
@@ -97,7 +97,7 @@ data ExtractionState = ExtractionState
     , esTypeSystem  :: TypeSystem
     , esContext     :: [Context 'Local]
     , esNextId      :: Int
-    , esCallSiteId  :: Integer
+    , esCallSiteId  :: Int
     , esCurrentCFG  :: Maybe (CFG Text)
     , esSeenNodes   :: Set Int
     , esReturnType  :: Maybe (TypeInfo 'Local)
@@ -136,7 +136,7 @@ nextTemplateIdx mHint idx = do
 nextTemplateQual :: Text -> Extract (TypeInfo 'Local)
 nextTemplateQual qual = nextTemplate (Just qual)
 
-extractConstraints :: TypeSystem -> FilePath -> Node (Lexeme Text) -> Int -> Integer -> ([Constraint 'Local], [ErrorInfo 'Local], Int, Integer)
+extractConstraints :: TypeSystem -> FilePath -> Node (Lexeme Text) -> Int -> Int -> ([Constraint 'Local], [ErrorInfo 'Local], Int, Int)
 extractConstraints ts path node startId startCallSiteId =
     let s = execState (collectDefs node >> withContext (InFile path) (checkNode node)) initialState
     in (esConstraints s, esErrors s, esNextId s, esCallSiteId s)

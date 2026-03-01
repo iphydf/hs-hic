@@ -595,7 +595,7 @@ getDescrTemplates = \case
 
 class PhaseOps (p :: Phase) where
     fromGlobalId :: TemplateId 'Global -> TemplateId p
-    fromPoly :: Integer -> Int -> Maybe Text -> Origin -> TemplateId p
+    fromPoly :: Int -> Int -> Maybe Text -> Origin -> TemplateId p
 
 instance PhaseOps 'Global where
     fromGlobalId = \case
@@ -613,7 +613,7 @@ instance PhaseOps 'Local where
         TIdRec i           -> TIdRec i
     fromPoly ph i h o = TIdPoly ph i h o
 
-instantiateDescr :: PhaseOps q => Integer -> Origin -> Map (TemplateId 'Global) (TypeInfo q) -> TypeDescr 'Global -> TypeDescr q
+instantiateDescr :: PhaseOps q => Int -> Origin -> Map (TemplateId 'Global) (TypeInfo q) -> TypeDescr 'Global -> TypeDescr q
 instantiateDescr ph origin m descr =
     case descr of
         StructDescr l _ mems invs ->
@@ -627,7 +627,7 @@ instantiateDescr ph origin m descr =
         IntDescr l std -> IntDescr l std
         EnumDescr l mems -> EnumDescr l (map (instantiate ph origin m) mems)
 
-instantiateInvariant :: PhaseOps q => Integer -> Origin -> Map (TemplateId 'Global) (TypeInfo q) -> Invariant 'Global -> Invariant q
+instantiateInvariant :: PhaseOps q => Int -> Origin -> Map (TemplateId 'Global) (TypeInfo q) -> Invariant 'Global -> Invariant q
 instantiateInvariant ph origin m = \case
     InvCallable f as r -> InvCallable (inst f) (map inst as) (inst r)
     InvEquality t1 t2  -> InvEquality (inst t1) (inst t2)
@@ -636,7 +636,7 @@ instantiateInvariant ph origin m = \case
   where
     inst = instantiate ph origin m
 
-instantiate :: PhaseOps q => Integer -> Origin -> Map (TemplateId 'Global) (TypeInfo q) -> TypeInfo 'Global -> TypeInfo q
+instantiate :: PhaseOps q => Int -> Origin -> Map (TemplateId 'Global) (TypeInfo q) -> TypeInfo 'Global -> TypeInfo q
 instantiate ph origin m = foldFix alg
   where
     alg f = case f of
@@ -662,7 +662,7 @@ instantiateGlobal m = foldFix alg
                 Nothing  -> Fix f
         _ -> Fix f
 
-toLocal :: Integer -> Origin -> TypeInfo 'Global -> TypeInfo 'Local
+toLocal :: Int -> Origin -> TypeInfo 'Global -> TypeInfo 'Local
 toLocal ph origin = instantiate ph origin Map.empty
 
 getTypeParams :: PhaseOps p => TypeSystem -> TypeInfo p -> Maybe [TypeInfo p]

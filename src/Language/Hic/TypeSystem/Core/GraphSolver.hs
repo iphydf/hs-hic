@@ -11,6 +11,7 @@ module Language.Hic.TypeSystem.Core.GraphSolver
     ) where
 
 import qualified Data.Graph                                    as Graph
+import           Data.List                                     (foldl')
 import           Data.Map.Strict                               (Map)
 import qualified Data.Map.Strict                               as Map
 import           Data.Maybe                                    (fromMaybe)
@@ -42,7 +43,7 @@ solveAll graph starts =
     let reachableKeys = collectReachable Set.empty starts
         nodes = [ (k, k, getDeps k) | k <- Set.toList reachableKeys ]
         sccs = Graph.stronglyConnComp nodes
-    in foldl resolveScc Map.empty sccs
+    in foldl' resolveScc Map.empty sccs
   where
     getDeps k = case Map.lookup k graph of
         Nothing  -> []
@@ -59,7 +60,7 @@ solveAll graph starts =
 
     substituteAll acc g =
         let vars = TG.collectTemplateVarsFromGraph g
-            substituted = foldl (\accG v -> case Map.lookup v acc of
+            substituted = foldl' (\accG v -> case Map.lookup v acc of
                                     Just vG -> TG.substitute v vG accG
                                     Nothing -> accG) g vars
         in minimizeGraph substituted
@@ -70,11 +71,12 @@ solveAll graph starts =
             Just gs ->
                 let isVar ft = ftId ft == ftId k
                     resolvedGraphs = map (substituteAll acc) (Set.toList gs)
-                    merged = foldl (joinGraph isVar) (TG.fromTypeInfo TS.Unconstrained) resolvedGraphs
+                    merged = foldl' (joinGraph isVar) (TG.fromTypeInfo TS.Unconstrained) resolvedGraphs
                 in Map.insert k (minimizeGraph merged) acc
 
     resolveCyclicScc acc ks =
-        let isInternal ft = ftId ft `elem` map ftId ks
+        let internalIds = Set.fromList (map ftId ks)
+            isInternal ft = ftId ft `Set.member` internalIds
 
             -- In the domain of equi-recursive types, LFP is handled by TG.lfp.
             lfp' v g = TG.lfp v g
