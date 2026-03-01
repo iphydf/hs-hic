@@ -9,8 +9,6 @@ import           Control.Monad.State.Strict                  (evalState)
 import qualified Control.Monad.State.Strict                  as State
 import           Data.Map.Strict                             (Map)
 import qualified Data.Map.Strict                             as Map
-import           Data.Set                                    (Set)
-import qualified Data.Set                                    as Set
 import           Data.Text                                   (Text)
 import qualified Data.Text                                   as T
 import           Language.Cimple                             (Lexeme (..))
@@ -53,11 +51,16 @@ import           Language.Hic.TypeSystem.Ordered.Unification (Unify,
                                                               resolveType,
                                                               runUnification,
                                                               subtype, unify)
+import qualified Data.IntMap.Strict                          as IntMap
+import qualified Data.Set                                    as Set
 import           Test.Hspec
+
+mkUnifyStateFromBindings :: TS.TypeSystem -> Map.Map (TS.FullTemplate 'TS.Local) (TS.TypeInfo 'TS.Local, Provenance 'TS.Local) -> UnifyState
+mkUnifyStateFromBindings ts bindings = UnifyState bindings (buildBindingsIndex bindings) Set.empty [] ts IntMap.empty 0 True
 
 runUnifyWithBindings :: TS.TypeSystem -> Map.Map (TS.FullTemplate 'TS.Local) (TS.TypeInfo 'TS.Local, Provenance 'TS.Local) -> Unify a -> a
 runUnifyWithBindings ts bindings action =
-    evalState action (UnifyState bindings (buildBindingsIndex bindings) [] ts Set.empty 0 True)
+    evalState action (mkUnifyStateFromBindings ts bindings)
 
 spec :: Spec
 spec = do
@@ -244,6 +247,23 @@ spec = do
                 void $ unify t0 (Pointer t1) GeneralMismatch Nothing []
                 void $ unify t1 (Pointer t0) GeneralMismatch Nothing []
         urErrors res `shouldSatisfy` null
+
+    it "resolves mutual template cycles with applyBindingsDeep" $ do
+        -- T0 = T1*, T1 = T0* forms an indirect cycle.
+        -- applyBindingsDeep should produce a finite resolved type
+        -- (using TIdRec for the back-edge) rather than diverging.
+        let t0 = tLocalName "T0"
+        let t1 = tLocalName "T1"
+        let resolved = runUnifyWithBindings ts Map.empty $ do
+                void $ unify t0 (Pointer t1) GeneralMismatch Nothing []
+                void $ unify t1 (Pointer t0) GeneralMismatch Nothing []
+                applyBindingsDeep t0
+        -- T0 = T1* and T1 = T0*.  The graph solver detects the mutual cycle
+        -- and resolves T0 to Pointer(TIdRec 0) — a recursive type where
+        -- TIdRec 0 is a back-reference to T0 itself.
+        case resolved of
+            Pointer (Template (TS.TIdRec _) Nothing) -> return ()
+            other -> expectationFailure $ "expected Pointer(TIdRec _), got: " ++ show other
 
     it "binds templates with wrappers" $ do
         let t0 = tLocalName "T0"
@@ -824,7 +844,7 @@ spec = do
         let bindings = Map.fromList [( ftLocalName "T0", (owner, FromContext (ErrorInfo Nothing [] (CustomError "foo") [])) )]
 
         let res = runUnification ts $ do
-                State.modify $ \s -> s { usBindings = bindings }
+                State.modify $ \s -> s { usBindings = bindings, usBindingsIndex = buildBindingsIndex bindings }
                 void $ subtype t owner GeneralMismatch Nothing []
         urErrors res `shouldSatisfy` null
 
@@ -954,7 +974,7 @@ spec = do
         let initialBindings = Map.fromList [( t0, (BuiltinType S32Ty, FromContext (ErrorInfo Nothing [] (CustomError "init") [])) )]
         let t1 = TS.toLocal 0 TS.TopLevel $ TypeRef StructRef (C.L (C.AlexPn 0 0 0) C.IdSueType (TS.TIdName "Tox")) [Template (TS.TIdName "T0") Nothing]
         let t2 = TS.toLocal 0 TS.TopLevel $ TypeRef StructRef (C.L (C.AlexPn 0 0 0) C.IdSueType (TS.TIdName "Tox")) [BuiltinType F32Ty]
-        let finalState = State.execState (void $ unify t1 t2 GeneralMismatch Nothing []) (UnifyState initialBindings (buildBindingsIndex initialBindings) [] ts Set.empty 0 True)
+        let finalState = State.execState (void $ unify t1 t2 GeneralMismatch Nothing []) (mkUnifyStateFromBindings ts initialBindings)
         length (usErrors finalState) `shouldSatisfy` (> 0)
 
     it "detects conflict between Template (bound to Struct) and Builtin" $ do
@@ -962,7 +982,7 @@ spec = do
             structTy = TS.toLocal 0 TS.TopLevel $ TypeRef StructRef (C.L (C.AlexPn 0 0 0) C.IdSueType (TS.TIdName "My_Struct")) []
             intTy = BuiltinType S32Ty
             initialBindings = Map.fromList [(t0, (structTy, FromContext (ErrorInfo Nothing [] (CustomError "init") [])))]
-            finalState = State.execState (void $ unify (Template (TS.ftId t0) (TS.ftIndex t0)) intTy GeneralMismatch Nothing []) (UnifyState initialBindings (buildBindingsIndex initialBindings) [] ts Set.empty 0 True)
+            finalState = State.execState (void $ unify (Template (TS.ftId t0) (TS.ftIndex t0)) intTy GeneralMismatch Nothing []) (mkUnifyStateFromBindings ts initialBindings)
         length (usErrors finalState) `shouldSatisfy` (> 0)
 
     it "preserves template arguments of StructRef in resolveType" $ do

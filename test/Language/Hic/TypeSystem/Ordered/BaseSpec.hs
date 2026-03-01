@@ -1441,6 +1441,18 @@ spec = do
                 ]
             shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog
 
+        it "handles mutual recursion with generic pointer exchange" $ do
+            -- Mutually recursive functions that pass void* to each other,
+            -- creating indirect template cycles (T_f -> ...T_g..., T_g -> ...T_f...)
+            -- that must be resolved correctly by resolveBindings.
+            prog <- mustParse
+                [ "void my_b(void *q);"
+                , "void my_a(void *p) { my_b(p); }"
+                , "void my_b(void *q) { my_a(q); }"
+                , "void test(int *x) { my_a(x); }"
+                ]
+            shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog
+
         it "infers polymorphic type through multiple recursive calls" $ do
             prog <- mustParse
                 [ "void h(void *p) { h(p); }"

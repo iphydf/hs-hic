@@ -3,7 +3,10 @@ load("@rules_haskell//haskell:defs.bzl", "haskell_binary")
 haskell_binary(
     name = "hic-check",
     srcs = ["hic-check.hs"],
-    ghcopts = ["-rtsopts", "-with-rtsopts=-A64m"],
+    ghcopts = [
+        "-rtsopts",
+        "-with-rtsopts=-A64m",
+    ],
     tags = [
         "haskell",
         "no-cross",
@@ -11,13 +14,13 @@ haskell_binary(
     visibility = ["//visibility:public"],
     deps = [
         "//hs-cimple",
+        "//hs-hic",
         "//hs-hic:hic-ast-inference",
         "//hs-hic:hic-core",
         "//hs-hic:hic-refined",
         "//hs-hic:hic-typesystem-core",
         "//hs-hic:hic-typesystem-ordered",
         "//hs-hic:hic-typesystem-standard",
-        "//hs-hic:hs-hic",
         "//third_party/haskell:aeson",
         "//third_party/haskell:base",
         "//third_party/haskell:bytestring",

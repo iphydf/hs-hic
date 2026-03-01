@@ -91,7 +91,6 @@ import           Language.Hic.TypeSystem.Core.Base                    (isPointer
                                                                        stripAllWrappers,
                                                                        unwrap)
 import qualified Language.Hic.TypeSystem.Core.Base                    as TS
-import           Language.Hic.TypeSystem.Core.Constraints             (mapTypes)
 import qualified Language.Hic.TypeSystem.Core.GraphSolver             as GS
 import qualified Language.Hic.TypeSystem.Core.TypeGraph               as TG
 import           Language.Hic.TypeSystem.Ordered.ArrayUsage           (ArrayUsageResult (..))
@@ -121,6 +120,7 @@ instance ToJSON OrderedSolverResult
 data SolverState = SolverState
     { ssBindings      :: Map (FullTemplate 'Local) (TypeInfo 'Local, Provenance 'Local)
     , ssBindingsIndex :: Map (TemplateId 'Local) (Set (FullTemplate 'Local))
+    , ssCyclicKeys    :: Set (FullTemplate 'Local)
     , ssErrors        :: [ErrorInfo 'Local]
     , ssTypeSystem    :: TypeSystem
     , ssArrayUsage    :: ArrayUsageResult
@@ -138,9 +138,17 @@ type Solver = State SolverState
 runOrderedSolver :: TypeSystem -> ArrayUsageResult -> InvariantResult -> [SccType] -> ConstraintGenResult -> OrderedSolverResult
 runOrderedSolver _ aur ir sccs cgr =
     let ts = irTypeSystem ir
-        initialState = SolverState Map.empty Map.empty [] ts aur Map.empty ir (cgrFuncPhases cgr) Set.empty 0 True Set.empty
+        initialState = SolverState Map.empty Map.empty Set.empty [] ts aur Map.empty ir (cgrFuncPhases cgr) Set.empty 0 True Set.empty
         finalState = execState (mapM_ (solveScc (cgrConstraints cgr)) sccs) initialState
     in OrderedSolverResult (reverse $ ssErrors finalState) (ssInferred finalState)
+
+-- | Classify whether a constraint is "dependent" -- i.e. it needs resolved
+-- bindings to look up function signatures, struct members, or check triggers.
+isDependent :: Constraint 'Local -> Bool
+isDependent Callable{}         = True
+isDependent HasMember{}        = True
+isDependent CoordinatedPair{}  = True
+isDependent _                  = False
 
 solveScc :: Map Text [Constraint 'Local] -> SccType -> Solver ()
 solveScc constrMap scc = do
@@ -165,13 +173,17 @@ solveScc constrMap scc = do
         Cyclic funcs -> do
             State.modify $ \s -> s { ssFinalPass = False }
             let constrs = concatMap (\f -> Map.findWithDefault [] f constrMap) funcs
-            -- Structural Pass 1: Build initial structural bindings
+                depConstrs = filter isDependent constrs
+            -- Pass 1: Build initial structural bindings from all constraints
             mapM_ solveConstraint constrs
             resolveBindings
-            -- Structural Pass 2: Resolve HasMember/Callable using Pass 1 info
-            mapM_ solveConstraint constrs
+            -- Pass 2: Re-process only dependent constraints (Callable/HasMember/
+            -- CoordinatedPair) which need resolved bindings to look up function
+            -- signatures and struct members.  Structural constraints (Equality/
+            -- Subtype) already established bindings in pass 1.
+            mapM_ solveConstraint depConstrs
             resolveBindings
-            -- Pass 3: Final propagation and settling
+            -- Pass 3: Final propagation and error reporting
             State.modify $ \s -> s { ssFinalPass = True }
             mapM_ solveConstraint constrs
             resolveBindings
@@ -185,6 +197,7 @@ resolveBindings :: Solver ()
 resolveBindings = do
     bindings <- State.gets ssBindings
     resolvedKeys <- State.gets ssResolvedKeys
+    cyclicKeys <- State.gets ssCyclicKeys
     let newKeys = Map.keysSet bindings `Set.difference` resolvedKeys
     if Set.null newKeys then return ()
     else do
@@ -193,15 +206,28 @@ resolveBindings = do
             -- Pre-substitute already-resolved binding values into new binding types
             -- so the graph solver only needs to handle new-to-new dependencies.
             preSubst = Map.map (\(ty, prov) -> (substBindings resolvedBindings ty, prov)) newBindings
-            graph = Map.map (\(ty, _) -> Set.singleton (TG.fromTypeInfo ty)) preSubst
-            resolvedMap = GS.solveAll graph (Map.keys preSubst)
-        State.modify $ \s -> s
-            { ssBindings = Map.mapWithKey (\k (ty, prov) ->
-                if Set.member k newKeys
-                then (maybe ty TG.toTypeInfo (Map.lookup k resolvedMap), prov)
-                else (ty, prov)) (ssBindings s)
-            , ssResolvedKeys = Map.keysSet bindings
-            }
+            -- Phase 3: Only use graph solver if there are cyclic bindings among new keys
+            hasCyclic = not (Set.null (Set.intersection newKeys cyclicKeys))
+        if not hasCyclic
+          then do
+            -- Tier 1: Deep chain substitution for non-cyclic bindings
+            let allBindings = resolvedBindings `Map.union` preSubst
+                resolvedNew = Map.map (\(ty, prov) -> (resolveDeep allBindings Set.empty ty, prov)) preSubst
+            State.modify $ \s -> s
+                { ssBindings = Map.union resolvedNew (ssBindings s)
+                , ssResolvedKeys = Map.keysSet bindings
+                }
+          else do
+            -- Tier 2: Full graph solver for cyclic bindings
+            let graph = Map.map (\(ty, _) -> Set.singleton (TG.fromTypeInfo ty)) preSubst
+                resolvedMap = GS.solveAll graph (Map.keys preSubst)
+            State.modify $ \s -> s
+                { ssBindings = Map.mapWithKey (\k (ty, prov) ->
+                    if Set.member k newKeys
+                    then (maybe ty TG.toTypeInfo (Map.lookup k resolvedMap), prov)
+                    else (ty, prov)) (ssBindings s)
+                , ssResolvedKeys = Map.keysSet bindings
+                }
 
 captureSignature :: Text -> [Constraint 'Local] -> Solver ()
 captureSignature func _ = do
@@ -246,6 +272,20 @@ captureSignature func _ = do
         TIdAnonymous i h -> TIdAnonymous i h
         TIdRec i         -> TIdRec i
 
+-- | Create a 'UnifyState' from the current solver state.
+mkUnifyState :: SolverState -> U.UnifyState
+mkUnifyState st = U.UnifyState (ssBindings st) (ssBindingsIndex st) Set.empty [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
+
+-- | Merge results from a completed 'UnifyState' back into the solver state.
+mergeUnifyState :: Bool -> U.UnifyState -> SolverState -> SolverState
+mergeUnifyState collectErrors us s = s
+    { ssBindings = U.usBindings us
+    , ssBindingsIndex = U.usBindingsIndex us
+    , ssCyclicKeys = U.usCyclicKeys us `Set.union` ssCyclicKeys s
+    , ssErrors = if collectErrors then U.usErrors us ++ ssErrors s else ssErrors s
+    , ssNextId = U.usNextId us
+    }
+
 solveConstraint :: Constraint 'Local -> Solver ()
 solveConstraint c = do
     State.gets ssFinalPass >>= \final -> when final $ dtraceM $ "solveConstraint: " ++ show c
@@ -255,15 +295,10 @@ solveConstraint c = do
             Subtype actual expected loc ctx reason -> void $ U.subtype actual expected reason loc ctx
             _ -> return ()
 
-    let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
+    let initialState = mkUnifyState st
     let finalUnifyState = execState action initialState
 
-    State.modify $ \s -> s
-        { ssBindings = U.usBindings finalUnifyState
-        , ssBindingsIndex = U.usBindingsIndex finalUnifyState
-        , ssErrors = if ssFinalPass st then U.usErrors finalUnifyState ++ ssErrors s else ssErrors s
-        , ssNextId = U.usNextId finalUnifyState
-        }
+    State.modify $ mergeUnifyState (ssFinalPass st) finalUnifyState
 
     case c of
         Callable ft atys rt loc ctx csId shouldRefresh ->
@@ -277,7 +312,7 @@ solveConstraint c = do
 solveCoordinatedPair :: TypeInfo 'Local -> TypeInfo 'Local -> TypeInfo 'Local -> Maybe (Lexeme Text) -> [Context 'Local] -> Maybe Int -> Solver ()
 solveCoordinatedPair trigger actual expected loc ctx mCsId = do
     st <- State.get
-    let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
+    let initialState = mkUnifyState st
     let tr = evalState (U.resolveType =<< U.applyBindings trigger) initialState
     let ft = TS.toFlat tr
     dtraceM $ "solveCoordinatedPair trigger=" ++ show tr ++ " quals=" ++ show (TS.ftQuals ft)
@@ -285,12 +320,7 @@ solveCoordinatedPair trigger actual expected loc ctx mCsId = do
         then do
             expected' <- refreshTemplates mCsId expected
             let finalUnifyState = execState (void $ U.unify actual expected' GeneralMismatch loc ctx) initialState
-            State.modify $ \s -> s
-                { ssBindings = U.usBindings finalUnifyState
-                , ssBindingsIndex = U.usBindingsIndex finalUnifyState
-                , ssErrors = U.usErrors finalUnifyState ++ ssErrors s
-                , ssNextId = U.usNextId finalUnifyState
-                }
+            State.modify $ mergeUnifyState True finalUnifyState
         else return ()
 
 solveMemberAccess :: TypeInfo 'Local -> Text -> TypeInfo 'Local -> MismatchReason -> Maybe (Lexeme Text) -> [Context 'Local] -> Solver ()
@@ -323,14 +353,9 @@ solveMemberAccess t field mt reason ml ctx = do
                             let mty' = TS.instantiate 0 (TS.Source name) argMap mty
                             let mty'' = maybe mty' (`Spec.specializeType` mty') mIdx
                             st <- State.get
-                            let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
+                            let initialState = mkUnifyState st
                             let finalUnifyState = execState (U.unify mty'' mt reason ml ctx) initialState
-                            State.modify $ \s -> s
-                                { ssBindings = U.usBindings finalUnifyState
-                                , ssBindingsIndex = U.usBindingsIndex finalUnifyState
-                                , ssErrors = U.usErrors finalUnifyState ++ ssErrors s
-                                , ssNextId = U.usNextId finalUnifyState
-                                }
+                            State.modify $ mergeUnifyState True finalUnifyState
 
                             -- TRIGGER STRUCT INVARIANTS
                             let invariants = case descr of
@@ -419,7 +444,7 @@ substBindings bindings = foldFix $ \case
 resolveType :: TypeInfo 'Local -> Solver (TypeInfo 'Local)
 resolveType ty = do
     st <- State.get
-    let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
+    let initialState = mkUnifyState st
     return $ evalState (U.resolveType ty) initialState
 
 reportError :: Maybe (Lexeme Text) -> [Context 'Local] -> TypeError 'Local -> Solver ()
@@ -481,7 +506,7 @@ solveCallable ft atys rt reason ml ctx mCsId shouldRefresh = do
                 nExpected = length expectedParams
                 nActual = length atys
             st <- State.get
-            let initialState = U.UnifyState (ssBindings st) (ssBindingsIndex st) [] (ssTypeSystem st) IntMap.empty (ssNextId st) (ssFinalPass st)
+            let initialState = mkUnifyState st
             let action = do
                     void $ U.unify ret rt reason ml ctx
                     if isVariadic then
@@ -492,12 +517,7 @@ solveCallable ft atys rt reason ml ctx mCsId shouldRefresh = do
                         else if nActual > nExpected then U.reportError ml ctx (TooManyArgs nExpected nActual)
                         else mapM_ (uncurry (\a p -> void $ U.subtype a p reason ml ctx)) (zip atys expectedParams)
             let finalUnifyState = execState action initialState
-            State.modify $ \s -> s
-                { ssBindings = U.usBindings finalUnifyState
-                , ssBindingsIndex = U.usBindingsIndex finalUnifyState
-                , ssErrors = U.usErrors finalUnifyState ++ ssErrors s
-                , ssNextId = U.usNextId finalUnifyState
-                }
+            State.modify $ mergeUnifyState True finalUnifyState
         Template tid i -> do
             bindings <- State.gets ssBindings
             case mCsId of

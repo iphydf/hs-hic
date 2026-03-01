@@ -120,6 +120,7 @@ data UnifyResult = UnifyResult
 data UnifyState = UnifyState
     { usBindings      :: Map (FullTemplate 'Local) (TypeInfo 'Local, Provenance 'Local)
     , usBindingsIndex :: Map (TemplateId 'Local) (Set (FullTemplate 'Local))
+    , usCyclicKeys    :: Set (FullTemplate 'Local)
     , usErrors        :: [ErrorInfo 'Local]
     , usTypeSystem    :: TypeSystem
     , usSeen          :: IntMap (Set (TypeInfo 'Local, TypeInfo 'Local, QualState))
@@ -131,7 +132,7 @@ type Unify = State UnifyState
 
 runUnification :: TypeSystem -> Unify a -> UnifyResult
 runUnification ts action =
-    let initialState = UnifyState Map.empty Map.empty [] ts IntMap.empty 0 True
+    let initialState = UnifyState Map.empty Map.empty Set.empty [] ts IntMap.empty 0 True
         finalState = execState action initialState
     in UnifyResult (usErrors finalState) (usBindings finalState)
 
@@ -545,7 +546,8 @@ bind tid index ty reason ml ctx = do
                             let prov = FromContext (ErrorInfo ml ctx (TypeMismatch (Template tid' index') ty reason Nothing) [])
                             dtraceM $ "  BIND (Occurs): " ++ show (Template tid' index') ++ " -> " ++ show ty
                             State.modify $ \s' -> s' { usBindings = Map.insert k (ty, prov) (usBindings s')
-                                                     , usBindingsIndex = Map.insertWith Set.union tid' (Set.singleton k) (usBindingsIndex s') }
+                                                     , usBindingsIndex = Map.insertWith Set.union tid' (Set.singleton k) (usBindingsIndex s')
+                                                     , usCyclicKeys = Set.insert k (usCyclicKeys s') }
                         Unsupported _ -> return ()
                         _ -> do
                             let prov = FromContext (ErrorInfo ml ctx (TypeMismatch (Template tid' index') ty reason Nothing) [])

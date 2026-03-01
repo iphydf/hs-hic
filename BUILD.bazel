@@ -208,7 +208,7 @@ haskell_library(
 
 hspec_test(
     name = "testsuite",
-    size = "medium",
+    size = "large",
     deps = [
         ":hic-ast-inference",
         ":hic-core",
@@ -234,7 +234,7 @@ hspec_test(
 
 hspec_test(
     name = "test-typesystem-core",
-    size = "small",
+    size = "medium",
     srcs = glob(["test/Language/Hic/TypeSystem/Core/**/*.hs"]),
     deps = [
         ":hic-core",
