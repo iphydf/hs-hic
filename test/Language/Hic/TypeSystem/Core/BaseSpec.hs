@@ -30,6 +30,20 @@ spec = do
                     _ -> expectationFailure "Expected 2 members"
             _ -> expectationFailure "Expected StructDescr for 'My_Struct'"
 
+    it "keeps an array typedef an array" $ do
+        prog <- mustParse ["typedef uint8_t Key[32];"]
+        let ts = TS.collect (Program.toList prog)
+        case Map.lookup "Key" ts of
+            Just (TS.AliasDescr _ _ (TS.Array (Just _) [_])) -> return ()
+            other -> expectationFailure $ "Expected an array alias, got " ++ show other
+
+    it "keeps an array parameter without a size an array" $ do
+        prog <- mustParse ["typedef void name_cb(const uint8_t name[_Nullable]);"]
+        let ts = TS.collect (Program.toList prog)
+        case Map.lookup "name_cb" ts of
+            Just (TS.FuncDescr _ _ _ [TS.Var _ (TS.Nullable (TS.Array (Just _) []))]) -> return ()
+            other -> expectationFailure $ "Expected an array parameter, got " ++ show other
+
     it "reuses named templates" $ do
         prog <- mustParse
             [ "typedef void *Generic;"

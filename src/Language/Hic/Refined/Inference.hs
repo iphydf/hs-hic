@@ -10,14 +10,21 @@
 
 module Language.Hic.Refined.Inference
     ( RefinedResult (..)
+    , Collected
     , inferRefined
+    , collectRefined
+    , collectedSize
+    , solveCollected
     , ProductState (..)
     ) where
 
 import           Control.Applicative                         ((<|>))
-import           Control.Monad                               (join, zipWithM_)
+import           Control.Monad                               (forM_, join,
+                                                              unless, void,
+                                                              when, zipWithM_)
 import           Control.Monad.State.Strict                  (State, get, gets,
                                                               modify, runState)
+import           Data.Containers.ListUtils                   (nubOrd, nubOrdOn)
 import           Data.Fix                                    (Fix (..), foldFix,
                                                               unFix)
 import           Data.Foldable                               (fold)
@@ -39,6 +46,8 @@ import           Data.Word                                   (Word32)
 import           Language.Cimple                             (Lexeme (..))
 import qualified Language.Cimple                             as C
 import           Language.Hic.Core.Errors
+import           Language.Hic.Refined.BufferSize             (analyseBufferSizes,
+                                                              sizeErrors)
 import           Language.Hic.Refined.Context
 import           Language.Hic.Refined.Inference.Lifter
 import           Language.Hic.Refined.Inference.Substitution
@@ -46,10 +55,12 @@ import           Language.Hic.Refined.Inference.Translator
 import           Language.Hic.Refined.Inference.Types
 import           Language.Hic.Refined.Inference.Utils
 import           Language.Hic.Refined.LatticeOp
+import           Language.Hic.Refined.Nullability            (checkNullability)
 import           Language.Hic.Refined.PathContext
+import           Language.Hic.Refined.Pretty                 (ppAnyRefinedType)
 import           Language.Hic.Refined.Registry
 import           Language.Hic.Refined.Solver                 (Constraint (..),
-                                                              solve)
+                                                              solveAll)
 import           Language.Hic.Refined.State
 
 import           Language.Hic.Ast                            (CleanupAction (..),
@@ -60,10 +71,14 @@ import           Language.Hic.Ast                            (CleanupAction (..)
                                                               TaggedUnionMember (..))
 import           Language.Hic.Inference                      (lower)
 import           Language.Hic.Inference.Program              (Program (..))
+import qualified Language.Hic.Refined.Inference.Platform     as Platform
 import           Language.Hic.Refined.Transition
 import           Language.Hic.Refined.Types
 
 import qualified Language.Hic.TypeSystem.Core.Base           as TS
+import           Prettyprinter                               (Doc, pretty,
+                                                              (<+>))
+import           Prettyprinter.Render.Terminal               (AnsiStyle)
 
 getHicLoc :: Node (Lexeme Text) -> Maybe (Lexeme Text)
 getHicLoc n = case foldFix C.concats n of
@@ -72,31 +87,71 @@ getHicLoc n = case foldFix C.concats n of
 
 -- | Traverses the Hic AST to identify hotspots for refined analysis.
 inferRefined :: TS.TypeSystem -> Program (Lexeme Text) -> RefinedResult
-inferRefined ts prog =
-    let (registry, st) = runState (translateAndCollect ts prog) (emptyTranslatorState ts)
-        hotspots = nub $ concatMap (concatMap collectHotspots) (Map.elems (progAsts prog))
-        resSolved = solve registry (tsNodes st) (tsConstraints st) (0, 1, 2, 0)
-        solverErrs = case resSolved of
-                        Right finalRefs ->
-                            dtrace ("Final refinements: " ++ show (mrRefinements finalRefs)) []
-                        Left ps -> dtrace ("SOLVER FAILED at " ++ show ps) [solverStateToErrorInfo (tsNodes st) ps]
-        res = RefinedResult hotspots (tsNodes st) registry resSolved (solverErrs ++ tsErrors st)
+inferRefined ts prog = solveCollected prog (collectRefined ts prog)
+
+-- | The constraints collected from a program, ready to solve.
+data Collected = Collected (Registry Word32) TranslatorState
+
+collectRefined :: TS.TypeSystem -> Program (Lexeme Text) -> Collected
+collectRefined ts prog = uncurry Collected $ runState (translateAndCollect ts prog) (emptyTranslatorState ts)
+
+-- | The number of type nodes collected.
+collectedSize :: Collected -> Int
+collectedSize (Collected _ st) = Map.size (tsNodes st)
+
+solveCollected :: Program (Lexeme Text) -> Collected -> RefinedResult
+solveCollected prog (Collected registry st) =
+    let hotspots = nub $ concatMap (concatMap collectHotspots) (Map.elems (progAsts prog))
+        (conflicts, finalRefs, steps, origins) = solveAll registry (tsNodes st) (Map.toList (tsDefinitions st)) (tsConstraints st) (0, 1, 2, 0)
+        resSolved = case conflicts of
+            (ps, _):_ -> Left ps
+            []        -> Right finalRefs
+        -- One line can conflict through several constraints (e.g. a cast and
+        -- the assignment it's in): report each conflicting pair once per line.
+        conflictKey ps = (psFile ps, fmap (\(L (C.AlexPn _ line _) _ _) -> line) (psOrigin ps), psNodeL ps, psNodeR ps)
+        fromCast (_, root) = Set.member (psNodeL root, psNodeR root) (tsCasts st)
+        solverErrs = [ solverStateToErrorInfo (tsNodes st) finalRefs (fromCast c) (fst c) | c <- nubOrdOn (conflictKey . fst) conflicts ]
+        lowered = [ (path, map lower ast) | (path, ast) <- Map.toList (progAsts prog) ]
+        sizes = analyseBufferSizes lowered
+        sizeErrs = sizeErrors sizes
+        platformErrs = Platform.checkPlatformUse lowered
+        nullErrs = checkNullability sizes lowered
+        res = RefinedResult hotspots (tsNodes st) registry resSolved steps origins (tsNodesByFunction st) (tsFunctionStarts st) (solverErrs ++ tsErrors st ++ sizeErrs ++ platformErrs ++ nullErrs)
     in dtrace ("tsTaggedUnions: " ++ show (Map.keys (tsTaggedUnions st))) res
 
-solverStateToErrorInfo :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> ProductState -> ErrorInfo 'TS.Global
-solverStateToErrorInfo nodes ps =
+solverStateToErrorInfo :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Bool -> ProductState -> ErrorInfo 'TS.Global
+solverStateToErrorInfo nodes refs cast ps =
     let loc = psOrigin ps
         file = fromMaybe "unknown" (psFile ps)
         ctx = [InFile file]
         -- Try to determine the error type
-        errType = case (Map.lookup (psNodeL ps) nodes, Map.lookup (psNodeR ps) nodes) of
-            (Just (AnyRigidNodeF (RReference _ QNonnull' _ _)), _) -> RefinedNullabilityMismatch
-            (_, Just (AnyRigidNodeF (RReference _ QNonnull' _ _))) -> RefinedNullabilityMismatch
+        errType = if cast then RefinedCastMismatch else case (Map.lookup (psNodeL ps) nodes, Map.lookup (psNodeR ps) nodes) of
+            (Just (AnyRigidNodeF (RReference _ QNullable' _ _)), Just (AnyRigidNodeF (RReference _ QNonnull' _ _))) -> RefinedNullabilityMismatch
+            (Just (AnyRigidNodeF (RReference _ QNonnull' _ _)), Just (AnyRigidNodeF (RReference _ QNullable' _ _))) -> RefinedNullabilityMismatch
             (Just (AnyRigidNodeF (RObject (VVariant _) _)), _) -> RefinedVariantMismatch
             (_, Just (AnyRigidNodeF (RObject (VVariant _) _))) -> RefinedVariantMismatch
             -- Fallback for now
             _ -> CustomError "Refined type mismatch detected in fixpoint solver"
-    in ErrorInfo loc ctx errType []
+    in ErrorInfo loc ctx errType
+        [ "NodeL:" <+> ppNode nodes refs (psDepthL ps) 4 (psNodeL ps)
+        , "NodeR:" <+> ppNode nodes refs (psDepthR ps) 4 (psNodeR ps)
+        ]
+
+-- | A node's type for an error message, with its variables as what the
+-- solution binds them to, cut off a few levels down, as types can be
+-- recursive.
+ppNode :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Int -> Word32 -> Doc AnsiStyle
+ppNode nodes refs varDepth = go
+  where
+    go limit nid
+        | limit <= 0 = "..."
+        | otherwise = case Map.lookup nid nodes of
+            Just (AnyRigidNodeF (RObject (VVar tid _) _))
+                | isRefinable tid
+                , Just bound <- getRefinement (variableKey nodes varDepth tid) refs
+                , bound /= nid -> go (limit - 1) bound
+            Just node -> ppAnyRefinedType (go (limit - 1)) node
+            Nothing -> pretty nid
 
 addError :: Maybe (Lexeme Text) -> TypeError 'TS.Global -> State TranslatorState ()
 addError loc err = modify $ \s ->
@@ -104,16 +159,43 @@ addError loc err = modify $ \s ->
 
 translateAndCollect :: TS.TypeSystem -> Program (Lexeme Text) -> State TranslatorState (Registry Word32)
 translateAndCollect ts prog = do
+    modify $ \s -> s { tsCurrentFile = "<types>", tsCurrentFunction = "<struct types>" }
     initialReg <- translateRegistry ts
+    modify $ \s -> s { tsCurrentFunction = "<implicit parameters>" }
     reg <- liftImplicitPolymorphism initialReg
+    modify $ \s -> s { tsCurrentFunction = "<top level>" }
     -- Pre-pass: gather all TaggedUnion definitions
     dtraceM ("translateAndCollect: gathering TaggedUnions from " ++ show (Map.size (progAsts prog)) ++ " files")
     mapM_ (mapM_ gatherTaggedUnions) (progAsts prog)
+    -- Pre-pass: every function's signature, so that a call is checked whatever
+    -- order the files come in. A prototype comes second: it has the
+    -- annotations (a definition's parameters often have none), and the body is
+    -- bound to it.
+    forM_ [True, False] $ \definitions -> forM_ (Map.toList (progAsts prog)) $ \(path, ast) -> do
+        modify $ \s -> s { tsCurrentFile = path }
+        mapM_ (declareFunctions definitions) ast
     mapM_ (\(path, ast) -> do
         modify $ \s -> s { tsCurrentFile = path }
         mapM_ (collectRefinements reg (PathContext Map.empty Map.empty)) ast
         ) (Map.toList (progAsts prog))
+    modify $ \s -> s { tsCurrentFile = "<struct calls>", tsCurrentFunction = "<struct calls>", tsFunctionLoc = Nothing }
+    applyStructCalls reg
     return reg
+
+-- | Registers the signatures of the function prototypes (or definitions) in a
+-- node.
+declareFunctions :: Bool -> Node (Lexeme Text) -> State TranslatorState ()
+declareFunctions definitions (Fix node) = case node of
+    CimpleNode (C.FunctionDecl _ proto)   -> unless definitions $ declare proto
+    CimpleNode (C.FunctionDefn _ proto _) -> when definitions $ declare proto
+    _                                     -> mapM_ (declareFunctions definitions) node
+  where
+    declare proto = case lower proto of
+        Fix (C.FunctionPrototype _ name _) -> do
+            st <- get
+            nid <- ownSignature =<< translateType (nodeToTypeInfo (tsTypeSystem st) (lower proto))
+            modify (addFunction (C.lexemeText name) nid)
+        _ -> return ()
 
 gatherTaggedUnions :: Node (Lexeme Text) -> State TranslatorState ()
 gatherTaggedUnions (Fix node) = case node of
@@ -224,19 +306,16 @@ collectRefinementsHic reg ctx loc = \case
         mapM_ (collectRefinements reg ctx . cleanupBody) c
         return Nothing
 
+    -- out = val; return ret;
     Raise out val retIntent -> do
-        _ <- traverse (collectRefinements reg ctx) out
-        mVal <- collectRefinements reg ctx val
-        st <- get
-        linkTypes loc ctx (tsCurrentReturn st) mVal
-        case retIntent of
-            ReturnValue v -> do
-                _ <- collectRefinements reg ctx v
-                return ()
-            ReturnError e -> do
-                _ <- collectRefinements reg ctx e
-                return ()
-            ReturnVoid    -> return ()
+        case out of
+            Just o  -> void $ collectRefinements reg ctx (Fix (CimpleNode (C.AssignExpr o C.AopEq val)))
+            Nothing -> void $ collectRefinements reg ctx val
+        let ret = case retIntent of
+                ReturnValue v -> Just v
+                ReturnError e -> Just e
+                ReturnVoid    -> Nothing
+        _ <- collectRefinements reg ctx (Fix (CimpleNode (C.Return ret)))
         return Nothing
 
     Transition fr to -> do
@@ -244,16 +323,23 @@ collectRefinementsHic reg ctx loc = \case
         _ <- collectRefinements reg ctx to
         return Nothing
 
-    TaggedUnionGet _ p o _isPtr _tf _tv _uf _m e -> do
-        _ <- collectRefinements reg ctx p
-        _ <- collectRefinements reg ctx o
-        _ <- collectRefinements reg ctx e
-        return Nothing
+    -- return obj->tag == tv ? obj->uf.m : e;
+    TaggedUnionGet _ p o _isPtr _tf tv uf m e -> collectFunction ctx loc p $ do
+        mObjId <- collectRefinements reg ctx o
+        _ <- collectRefinements reg ctx tv
+        mUnionId <- maybe (return Nothing) (\objId -> getMemberId reg objId (C.lexemeText uf)) mObjId
+        mMemberId <- maybe (return Nothing) (\uId -> getMemberId reg uId (C.lexemeText m)) mUnionId
+        mElseId <- collectRefinements reg ctx e
+        st <- get
+        linkTypes loc ctx (tsCurrentReturn st) mMemberId
+        linkTypes loc ctx (tsCurrentReturn st) mElseId
 
-    TaggedUnionGetTag _ p o _isPtr _tf -> do
-        _ <- collectRefinements reg ctx p
-        _ <- collectRefinements reg ctx o
-        return Nothing
+    -- return obj->tf;
+    TaggedUnionGetTag _ p o _isPtr tf -> collectFunction ctx loc p $ do
+        mObjId <- collectRefinements reg ctx o
+        mTagId <- maybe (return Nothing) (\objId -> getMemberId reg objId (C.lexemeText tf)) mObjId
+        st <- get
+        linkTypes loc ctx (tsCurrentReturn st) mTagId
 
     TaggedUnionConstruct o _isPtr _ty _tf _tv _uf _m d -> do
         _ <- collectRefinements reg ctx o
@@ -286,11 +372,11 @@ collectRefinementsHic reg ctx loc = \case
                 case mNode of
                     Just (AnyRigidNodeF (RReference (Arr eId _) _ _ _)) -> do
                         instId <- refreshInstance loc eId
-                        modify (\s -> s { tsConstraints = CInherit instId eId loc (tsCurrentFile s) : tsConstraints s })
+                        modify (addInherit loc instId eId)
                         return (Just instId)
                     Just (AnyRigidNodeF (RReference (Ptr (TargetObject eId)) _ _ _)) -> do
                         instId <- refreshInstance loc eId
-                        modify (\s -> s { tsConstraints = CInherit instId eId loc (tsCurrentFile s) : tsConstraints s })
+                        modify (addInherit loc instId eId)
                         return (Just instId)
                     _ -> return Nothing
             Nothing -> return Nothing
@@ -335,54 +421,13 @@ collectRefinementsCimpleType reg ctx = \case
 
 collectRefinementsCimpleDecl :: Registry Word32 -> PathContext -> Maybe (Lexeme Text) -> C.NodeF (Lexeme Text) (Node (Lexeme Text)) -> Maybe (State TranslatorState (Maybe Word32))
 collectRefinementsCimpleDecl reg ctx loc = \case
-        C.FunctionDecl _ protoNode -> Just $ do
-            st <- get
-            case lower protoNode of
-                Fix (C.FunctionPrototype _ name _) -> do
-                    let tyInfo = nodeToTypeInfo (tsTypeSystem st) (lower protoNode)
-                    nid <- translateType tyInfo
-                    modify (addFunction (C.lexemeText name) nid)
-                    return (Just nid)
-                _ -> return Nothing
+        -- Declared before collecting (declareFunctions).
+        C.FunctionDecl _ protoNode -> Just $ case lower protoNode of
+            Fix (C.FunctionPrototype _ name _) -> gets (Map.lookup (C.lexemeText name) . tsFunctions)
+            _                                  -> return Nothing
 
-        C.FunctionDefn _ proto body -> Just $ do
-            st <- get
-            case lower proto of
-                Fix (C.FunctionPrototype ret name params) -> do
-                    dtraceM ("collectRefinements: processing function " ++ show (C.lexemeText name))
-                    let tyInfo = nodeToTypeInfo (tsTypeSystem st) (lower proto)
-                    nid <- translateType tyInfo
-                    modify (addFunction (C.lexemeText name) nid)
-
-                    let retTyInfo = nodeToTypeInfo (tsTypeSystem st) ret
-                    retNid <- case retTyInfo of
-                        Fix (TS.BuiltinTypeF TS.VoidTy) -> return Nothing
-                        _ -> Just <$> translateType retTyInfo
-
-                    let oldRet = tsCurrentReturn st
-                    modify $ \s -> s { tsCurrentReturn = retNid }
-
-                    stPostRet <- get
-                    let paramIds = case Map.lookup nid (tsNodes stPostRet) of
-                            Just (AnyRigidNodeF (RFunction pIds _)) -> pIds
-                            _                                       -> []
-
-                    -- Bind parameters
-                    zipWithM_ (\pId pDecl -> case pDecl of
-                        Fix (C.VarDecl ty pName _) -> do
-                            st' <- get
-                            let pTyInfo = nodeToTypeInfo (tsTypeSystem st') ty
-                            pNid <- translateType pTyInfo
-                            pNid' <- refreshInstance loc pNid
-                            -- LINK: Propagate body refinements to signature
-                            modify (addConstraintCoerced loc ctx pId pNid')
-                            modify (addVar (C.lexemeText pName) pNid')
-                        _ -> return ()) paramIds params
-
-                    _ <- collectRefinements reg ctx body
-                    modify $ \s -> s { tsCurrentReturn = oldRet }
-                    return (Just nid)
-                _ -> return Nothing
+        C.FunctionDefn _ proto body -> Just $
+            collectFunction ctx loc proto (void $ collectRefinements reg ctx body)
 
         C.VarDecl ty name dims -> Just $ do
             st <- get
@@ -400,7 +445,9 @@ collectRefinementsCimpleDecl reg ctx loc = \case
         C.EnumDecl _ decls _ -> Just $ mapM_ (collectRefinements reg ctx) decls >> return Nothing
         C.EnumConsts _ decls -> Just $ mapM_ (collectRefinements reg ctx) decls >> return Nothing
         C.Enumerator _ mInit -> Just $ traverse (collectRefinements reg ctx) mInit >> return Nothing
-        C.MemberDecl ty _ -> Just $ collectRefinements reg ctx ty >> return Nothing
+        -- A member is no variable.
+        C.MemberDecl (Fix (CimpleNode C.VarDecl{})) _ -> Just $ return Nothing
+        C.MemberDecl decl _ -> Just $ collectRefinements reg ctx decl >> return Nothing
         C.AggregateDecl ty -> Just $ collectRefinements reg ctx ty >> return Nothing
         C.CallbackDecl _ _ -> Just $ return Nothing
 
@@ -432,13 +479,76 @@ collectRefinementsCimpleDecl reg ctx loc = \case
             return (Just arrId)
         _ -> Nothing
 
+-- | Links a call argument to its parameter. Whether an array parameter's
+-- argument is big enough is checked by "Language.Hic.Refined.BufferSize".
+linkArgument :: Maybe (Lexeme Text) -> PathContext -> Word32 -> Word32 -> State TranslatorState ()
+linkArgument loc ctx paramId argId = modify (addConstraintCoerced loc ctx argId paramId)
+
+-- | Collects a function definition: registers its type, binds its parameters
+-- and collects its body with the return type in scope.
+collectFunction :: PathContext -> Maybe (Lexeme Text) -> Node (Lexeme Text) -> State TranslatorState () -> State TranslatorState (Maybe Word32)
+collectFunction ctx loc proto collectBody = do
+    st <- get
+    case lower proto of
+        Fix (C.FunctionPrototype _ name params) -> do
+            dtraceM ("collectRefinements: processing function " ++ show (C.lexemeText name))
+            let L (C.AlexPn _ startLine _) _ _ = name
+                oldFunction = tsCurrentFunction st
+            let oldFunctionLoc = tsFunctionLoc st
+            modify $ \s -> s
+                { tsCurrentFunction = C.lexemeText name
+                , tsFunctionLoc = Just name
+                , tsFunctionStarts = Map.insertWith Map.union (tsCurrentFile s) (Map.singleton startLine (C.lexemeText name)) (tsFunctionStarts s)
+                }
+            -- The signature declared before collecting (declareFunctions).
+            nid <- case Map.lookup (C.lexemeText name) (tsFunctions st) of
+                Just declared -> return declared
+                Nothing -> do
+                    declared <- ownSignature =<< translateType (nodeToTypeInfo (tsTypeSystem st) (lower proto))
+                    modify (addFunction (C.lexemeText name) declared)
+                    return declared
+
+            stSig <- get
+            let (paramIds, retNid) = case Map.lookup nid (tsNodes stSig) of
+                    Just (AnyRigidNodeF (RFunction pIds (RetVal r))) -> (pIds, Just r)
+                    Just (AnyRigidNodeF (RFunction pIds RetVoid))    -> (pIds, Nothing)
+                    _                                                -> ([], Nothing)
+                oldRet = tsCurrentReturn st
+                -- The function's parameters and locals are its own.
+                oldVars = tsVars st
+            modify $ \s -> s { tsCurrentReturn = retNid }
+
+            -- Bind parameters
+            zipWithM_ (\pId pDecl -> case pDecl of
+                Fix (C.VarDecl _ pName _) -> do
+                    st' <- get
+                    -- The whole declaration, as in the signature: an array
+                    -- parameter's dimensions are in the declarator.
+                    let pTyInfo = nodeToTypeInfo (tsTypeSystem st') pDecl
+                    pNid <- translateType pTyInfo
+                    pNid' <- refreshInstance loc pNid
+                    -- LINK: Propagate body refinements to signature
+                    modify (addConstraintCoerced loc ctx pId pNid')
+                    modify (addVar (C.lexemeText pName) pNid')
+                _ -> return ()) paramIds params
+
+            collectBody
+            modify $ \s -> s { tsCurrentReturn = oldRet, tsCurrentFunction = oldFunction, tsFunctionLoc = oldFunctionLoc, tsVars = oldVars }
+            return (Just nid)
+        _ -> return Nothing
+
 collectRefinementsCimpleExpr :: Registry Word32 -> PathContext -> Maybe (Lexeme Text) -> C.NodeF (Lexeme Text) (Node (Lexeme Text)) -> Maybe (State TranslatorState (Maybe Word32))
 collectRefinementsCimpleExpr reg ctx loc = \case
-        C.AssignExpr lhs _ rhs -> Just $ do
+        C.AssignExpr lhs op rhs -> Just $ do
             mLhs <- collectRefinements reg ctx lhs
             mRhs <- collectRefinements reg ctx rhs
+            mNodeL <- maybe (return Nothing) lookThroughVariables mLhs
             case (mLhs, mRhs) of
-                (Just lId, Just rId) -> do
+                -- p += n is p = p + n: the pointer is assigned from itself, not from n.
+                (Just lId, Just _) | op `elem` [C.AopPlus, C.AopMinus] && isReference mNodeL -> do
+                    pId <- degradeToPointer lId
+                    modify (addConstraintCoerced loc ctx pId lId)
+                (Just lId, Just rId) ->
                     modify (addConstraintCoerced loc ctx rId lId)
                 _ -> return ()
             return mLhs
@@ -475,11 +585,15 @@ collectRefinementsCimpleExpr reg ctx loc = \case
             mNode <- case mId of
                 Just nid -> lookThroughVariables nid
                 Nothing  -> return Nothing
+            st0 <- get
+            let isFunctionName name = Map.notMember name (tsVars st0) && Map.member name (tsFunctions st0)
             case (op, mId) of
                 (C.UopIncr, Just nid) | not (isNumeric mNode) && isReference mNode -> Just <$> degradeToPointer nid
                 (C.UopDecr, Just nid) | not (isNumeric mNode) && isReference mNode -> Just <$> degradeToPointer nid
                 (C.UopIncr, _) -> return mId
                 (C.UopDecr, _) -> return mId
+                -- A function's name is already the pointer to it.
+                (C.UopAddress, Just nid) | Fix (CimpleNode (C.VarExpr l)) <- e, isFunctionName (C.lexemeText l) -> return (Just nid)
                 (C.UopAddress, Just nid) -> do
                     st <- get
                     case Map.lookup nid (tsNodes st) of
@@ -494,6 +608,7 @@ collectRefinementsCimpleExpr reg ctx loc = \case
 
                     mDerefNode <- lookThroughVariables nid
                     case mDerefNode of
+                        Just (AnyRigidNodeF (RReference (Arr eId _) _ _ _)) -> return (Just eId)
                         Just (AnyRigidNodeF (RReference (Ptr (TargetObject oId)) _ _ _)) -> return (Just oId)
                         Just (AnyRigidNodeF (RReference (Ptr (TargetOpaque tid)) _ _ quals)) ->
                             Just <$> register (AnyRigidNodeF (RObject (VVar tid Nothing) quals))
@@ -543,10 +658,22 @@ collectRefinementsCimpleExpr reg ctx loc = \case
             _ <- collectRefinements reg ctx cond
             mThen <- collectRefinements reg ctx then'
             mElse <- collectRefinements reg ctx else'
+            st <- get
+            let isNullptr nid = case Map.lookup nid (tsNodes st) of
+                    Just (AnyRigidNodeF (RReference (Ptr (TargetObject t)) _ _ _)) ->
+                        Map.lookup t (tsNodes st) == Just (AnyRigidNodeF (RObject (VBuiltin NullPtrTy) (Quals True False)))
+                    _ -> False
+                -- `c ? p : nullptr` is p or nothing: p, nullable.
+                orNull nid = case Map.lookup nid (tsNodes st) of
+                    Just (AnyRigidNodeF (RReference ref _ o q)) -> register (AnyRigidNodeF (RReference ref QNullable' o q))
+                    _                                         -> return nid
             case (mThen, mElse) of
-                (Just tId, Just eId) -> do
-                    modify (addConstraintCoerced loc ctx tId eId)
-                    return (Just tId)
+                (Just tId, Just eId)
+                    | isNullptr eId -> Just <$> orNull tId
+                    | isNullptr tId -> Just <$> orNull eId
+                    | otherwise -> do
+                        modify (addConstraintCoerced loc ctx tId eId)
+                        return (Just tId)
                 _ -> return (mThen <|> mElse)
 
         C.ArrayAccess obj idx -> Just $ do
@@ -567,12 +694,12 @@ collectRefinementsCimpleExpr reg ctx loc = \case
                                 Just (AnyRigidNodeF (RReference (Arr eId _) _ _ _)) -> do
                                     instId <- refreshInstance loc eId
                                     dtraceM ("ArrayAccess: created fresh instId=" ++ show instId ++ " from eId=" ++ show eId)
-                                    modify (\s -> s { tsConstraints = CInherit instId eId loc (tsCurrentFile s) : tsConstraints s })
+                                    modify (addInherit loc instId eId)
                                     modify $ \s -> s { tsArrayInstances = Map.insert (objId, i) instId (tsArrayInstances s) }
                                     return (Just instId)
                                 Just (AnyRigidNodeF (RReference (Ptr (TargetObject eId)) _ _ _)) -> do
                                     instId <- refreshInstance loc eId
-                                    modify (\s -> s { tsConstraints = CInherit instId eId loc (tsCurrentFile s) : tsConstraints s })
+                                    modify (addInherit loc instId eId)
                                     modify $ \s -> s { tsArrayInstances = Map.insert (objId, i) instId (tsArrayInstances s) }
                                     return (Just instId)
                                 _ -> return Nothing
@@ -638,15 +765,44 @@ collectRefinementsCimpleExpr reg ctx loc = \case
             let tyInfo = nodeToTypeInfo (tsTypeSystem st) (lower ty)
             newId <- translateType tyInfo
             newId' <- refreshInstance loc newId
+            mOld <- traverse lookThroughVariables mId
+            stCast <- get
+            let handleCast = maybe False Platform.isHandle (typeName (lower ty))
+            -- Whether a pointer is to bytes that are const.
+            let bytes :: TranslatorState -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe Bool
+                bytes st' node = case node of
+                    Just (AnyRigidNodeF (RReference (Ptr (TargetObject eId)) _ _ _)) -> byteConst st' eId
+                    Just (AnyRigidNodeF (RReference (Arr eId _) _ _ _))              -> byteConst st' eId
+                    _                                                                -> Nothing
+                byteConst :: TranslatorState -> Word32 -> Maybe Bool
+                byteConst st' eId = case Map.lookup eId (tsNodes st') of
+                    Just (AnyRigidNodeF (RObject (VBuiltin b) q)) | b `elem` [CharTy, U08Ty, S08Ty] -> Just (qConst q)
+                    _                                                                              -> Nothing
+                isSize = \case
+                    Just (AnyRigidNodeF (RObject VProperty{} _)) -> True
+                    Just (AnyRigidNodeF (RObject VSizeExpr{} _)) -> True
+                    _                                            -> False
+                newNode = Map.lookup newId (tsNodes stCast)
             case mId of
+                -- A cast between numbers (integers, enums, sizes) is a
+                -- conversion asked for: the number doesn't have to be the other
+                -- kind.
+                Just _ | isNumber (tsTypeSystem stCast) newNode, Just old <- mOld, isNumber (tsTypeSystem stCast) old || isSize old -> return ()
+                -- What the operating system's interfaces say may be cast.
+                Just oldId | platformView stCast newId oldId -> return ()
+                Just _ | Just old <- mOld, handleCast, isNumber (tsTypeSystem stCast) old -> return ()
+                -- Bytes are bytes: a char and a uint8_t have the same values
+                -- and may see the same memory. What's const stays so.
+                Just _ | Just old <- mOld, Just newConst <- bytes stCast newNode, Just oldConst <- bytes stCast old, newConst || not oldConst -> return ()
                 Just oldId ->
-                    modify (addConstraintCoerced loc ctx newId' oldId)
+                    modify (addCastConstraint loc ctx newId' oldId)
                 Nothing -> return ()
             return (Just newId')
 
         C.FunctionCall func args -> Just $ do
+            recordStructCalls reg ctx func args
             mFuncId <- collectRefinements reg ctx func
-            mArgIds <- mapM (collectRefinements reg ctx) args
+            mArgIds <- mapM (collectRefinements reg ctx) (readOnlyArgs func args)
             st <- get
             case mFuncId of
                 Just fId -> do
@@ -659,16 +815,14 @@ collectRefinementsCimpleExpr reg ctx loc = \case
                             dtraceM ("Indirect Call to " ++ show fId ++ " with " ++ show (length paramIds) ++ " params")
                             (paramIds', ret', nodeMapping) <- refreshSignature paramIds ret
                             -- Link instantiated variables back to origins: Information flows def -> call-site (One-Way)
-                            _ <- Map.traverseWithKey (\origId freshId -> modify $ \s -> s { tsConstraints = CInherit freshId origId loc (tsCurrentFile s) : tsConstraints s }) nodeMapping
+                            _ <- Map.traverseWithKey (\origId freshId -> modify (addInherit loc freshId origId)) nodeMapping
 
                             case matchObjPath func of
                                 Just (SymbolicPath (VarRoot name) []) ->
                                     hardenCall name paramIds' mArgIds ret' loc ctx
                                 _ -> return ()
 
-                            zipWithM_ (\p a -> case a of
-                                Just aId -> modify (addConstraintCoerced loc ctx aId p)
-                                Nothing  -> return ()) paramIds' mArgIds
+                            zipWithM_ (\p a -> traverse (linkArgument loc ctx p) a) paramIds' mArgIds
                             case ret' of
                                 RetVal rId -> return (Just rId)
                                 RetVoid    -> return Nothing
@@ -676,16 +830,14 @@ collectRefinementsCimpleExpr reg ctx loc = \case
                             dtraceM ("Direct Call to " ++ show fId ++ " with " ++ show (length paramIds) ++ " params")
                             (paramIds', ret', nodeMapping) <- refreshSignature paramIds ret
                             -- Link instantiated variables back to origins: One-Way inheritance
-                            _ <- Map.traverseWithKey (\origId freshId -> modify $ \s -> s { tsConstraints = CInherit freshId origId loc (tsCurrentFile s) : tsConstraints s }) nodeMapping
+                            _ <- Map.traverseWithKey (\origId freshId -> modify (addInherit loc freshId origId)) nodeMapping
 
                             case matchObjPath func of
                                 Just (SymbolicPath (VarRoot name) []) ->
                                     hardenCall name paramIds' mArgIds ret' loc ctx
                                 _ -> return ()
 
-                            zipWithM_ (\p a -> case a of
-                                Just aId -> modify (addConstraintCoerced loc ctx aId p)
-                                Nothing  -> return ()) paramIds' mArgIds
+                            zipWithM_ (\p a -> traverse (linkArgument loc ctx p) a) paramIds' mArgIds
                             case ret' of
                                 RetVal rId -> return (Just rId)
                                 RetVoid    -> return Nothing
@@ -815,35 +967,31 @@ collectRefinementsCimpleMisc reg ctx _loc = \case
         C.StaticAssert{} -> Just $ return Nothing
 
         C.AttrPrintf _ _ e -> Just $ collectRefinements reg ctx e
+        C.AttrAllocSize _ e -> Just $ collectRefinements reg ctx e
         _ -> Nothing
 
 
-resolveVVar :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> [Constraint] -> Word32 -> Word32
-resolveVVar nodes constraints = go Set.empty
+resolveVVar :: TranslatorState -> Word32 -> Word32
+resolveVVar st = go Set.empty
   where
     go visited nid
         | nid `Set.member` visited = nid
         | otherwise =
-            case Map.lookup nid nodes of
+            case Map.lookup nid (tsNodes st) of
                 Just (AnyRigidNodeF (RObject (VVar _ _) _)) ->
-                    let isMeetTarget = \case
-                            CSubtype l' r' PMeet _ _ _ _ _ _ | l' == nid -> Just r'
-                            _ -> Nothing
-                        isJoinTarget = \case
-                            CSubtype l' r' PJoin _ _ _ _ _ _ | l' == nid -> Just r'
-                            _ -> Nothing
-                        isInheritTarget = \case
-                            CInherit l' r' _ _ | l' == nid -> Just r'
-                            _ -> Nothing
-                    in case mapMaybe isMeetTarget constraints ++ mapMaybe isJoinTarget constraints ++ mapMaybe isInheritTarget constraints of
-                        (targetId:_) -> go (Set.insert nid visited) targetId
+                    let ts = lookThroughTargets st nid
+                        visited' = Set.insert nid visited
+                    -- Meets before inheritance; skip constraints back to a variable
+                    -- we've seen, e.g. from @p = p + 1@.
+                    in case filter (`Set.notMember` visited') ([t | (MeetTarget, t) <- ts] ++ [t | (InheritTarget, t) <- ts]) of
+                        (targetId:_) -> go visited' targetId
                         []           -> nid
                 _ -> nid
 
 lookThroughVariables :: Word32 -> State TranslatorState (Maybe (AnyRigidNodeF TemplateId Word32))
 lookThroughVariables nid = do
     st <- get
-    let resId = resolveVVar (tsNodes st) (tsConstraints st) nid
+    let resId = resolveVVar st nid
     return $ Map.lookup resId (tsNodes st)
 
 -- | Degrade an array reference to a pointer reference, preserving element type
@@ -857,9 +1005,43 @@ degradeToPointer nid = do
             register (AnyRigidNodeF (RReference (Ptr (TargetObject elementId)) nullability ownership quals))
         _ -> return nid
 
+-- | Whether a cast is from a pointer to one of the operating system's types
+-- to a pointer to another it may be seen as ('Platform.sameObject').
+platformView :: TranslatorState -> Word32 -> Word32 -> Bool
+platformView st newId oldId = case (pointee newId, pointee oldId) of
+    (Just a, Just b) -> Platform.sameObject a b
+    _                -> False
+  where
+    pointee nid = case Map.lookup (resolveVVar st nid) (tsNodes st) of
+        Just (AnyRigidNodeF (RReference (Ptr (TargetObject oid)) _ _ _)) -> case Map.lookup (resolveVVar st oid) (tsNodes st) of
+            Just (AnyRigidNodeF (RObject (VNominal (L _ _ (TIdName n)) _) _)) -> Just n
+            _                                                                -> Nothing
+        _ -> Nothing
+
+-- | A call's arguments, with a string cast to one that may be written given
+-- as it is where the function only reads it ('Platform.readOnlyStrings').
+readOnlyArgs :: Node (Lexeme Text) -> [Node (Lexeme Text)] -> [Node (Lexeme Text)]
+readOnlyArgs func args = case func of
+    Fix (CimpleNode (C.VarExpr (L _ _ f))) | Just ks <- Map.lookup f Platform.readOnlyStrings ->
+        [ if k `elem` ks then uncast arg else arg | (k, arg) <- zip [0 ..] args ]
+    _ -> args
+  where
+    uncast arg = case arg of
+        Fix (CimpleNode (C.CastExpr ty e))
+            | Just t <- typeName (lower ty), Platform.isStringPointer t -> e
+        _ -> arg
+
+-- | The name of a type that is just a name: one of C's or the platform's,
+-- or one a typedef gives.
+typeName :: C.Node (Lexeme Text) -> Maybe Text
+typeName (Fix node) = case node of
+    C.TyStd (L _ _ t)         -> Just t
+    C.TyUserDefined (L _ _ t) -> Just t
+    _                         -> Nothing
+
 followToNominal :: TranslatorState -> Word32 -> Maybe (Lexeme TemplateId, [Word32])
 followToNominal st nid =
-    let resId = resolveVVar (tsNodes st) (tsConstraints st) nid
+    let resId = resolveVVar st nid
     in case Map.lookup resId (tsNodes st) of
         Just (AnyRigidNodeF (RObject (VNominal l ps) _)) -> Just (l, ps)
         Just (AnyRigidNodeF (RObject (VExistential _ bodyId) _)) -> followToNominal st bodyId
@@ -875,21 +1057,29 @@ getObjectTypeName st nid =
         Nothing -> Nothing
 
 getMemberId :: Registry Word32 -> Word32 -> Text -> State TranslatorState (Maybe Word32)
-getMemberId reg nid fieldName = do
+getMemberId reg nid = memberOf reg nid False nid
+
+-- | Reads field @fieldName@ of the struct at @nid@, an access of instance
+-- @inst@: the struct's parameters become skolems tied to that instance.
+-- Through a pointer, a struct is an existential: it's another object, so its
+-- arguments say nothing about this instance and every parameter is a skolem.
+memberOf :: Registry Word32 -> Word32 -> Bool -> Word32 -> Text -> State TranslatorState (Maybe Word32)
+memberOf reg inst viaPointer nid fieldName = do
     st <- get
-    dtraceM ("getMemberId: entry nid=" ++ show nid ++ ", fieldName=" ++ show fieldName)
+    dtraceM ("memberOf: inst=" ++ show inst ++ ", nid=" ++ show nid ++ ", fieldName=" ++ show fieldName)
     let isBot' = case Map.lookup nid (tsNodes st) of
             Just (AnyRigidNodeF (RTerminal SBottom)) -> True
             _                                        -> False
+        skolem :: TemplateId -> State TranslatorState (Maybe Word32)
+        skolem tid = Just <$> instanceSkolem inst tid
     if isBot'
-    then dtrace ("getMemberId: nid=" ++ show nid ++ " is SBottom, returning SConflict") $ return (Just 2)
+    then return (Just 2) -- SConflict
     else do
         mNode <- lookThroughVariables nid
         case mNode of
             Just (AnyRigidNodeF (RObject (VNominal l params) _)) ->
                 let tyName = case C.lexemeText l of { TIdName n -> n; _ -> "" }
-                in dtrace ("getMemberId: nid=" ++ show nid ++ ", tyName=" ++ show tyName ++ ", fieldName=" ++ show fieldName) $
-                   case Map.lookup tyName (regDefinitions reg) of
+                in case Map.lookup tyName (regDefinitions reg) of
                     Just def -> do
                         let formalParams = case def of
                                 StructDef _ ps _ -> map fst ps
@@ -899,47 +1089,116 @@ getMemberId reg nid fieldName = do
                                 StructDef _ _ ms -> ms
                                 UnionDef _ _ ms  -> ms
                                 _                -> []
-                            substMap = Map.fromList (zip formalParams params)
-                        dtraceM ("getMemberId: substMap for " ++ show tyName ++ ": " ++ show substMap)
+                            substMap = if viaPointer then Map.empty else Map.fromList (zip formalParams params)
+                        modify $ \s -> s { tsStructInstances = Map.insertWith (Map.unionWith const) tyName
+                            (Map.singleton inst (if viaPointer then Nothing else Just substMap)) (tsStructInstances s) }
                         case find ((== fieldName) . C.lexemeText . mName) members of
                             Just mem -> do
+                                modify $ \s -> s { tsAccessedFields = Set.insert (inst, fieldName) (tsAccessedFields s) }
                                 let lookupFunc tid = case Map.lookup tid substMap of
-                                        Just actualId -> return (Just actualId)
-                                        Nothing | isRefinable tid -> do
-                                            let tid' = TIdSkolem nid nid (fromIntegral (Data.Hashable.hash tid))
-                                            resId <- register $ AnyRigidNodeF (RObject (VVar tid' Nothing) (Quals False False))
-                                            dtraceM ("getMemberId: lookupFunc tid=" ++ show tid ++ " -> fresh " ++ show resId)
-                                            return (Just resId)
-                                        Nothing -> dtrace ("getMemberId: lookupFunc tid=" ++ show tid ++ " -> Nothing") $ return Nothing
-                                modify $ \s -> s { tsSubstCache = Map.empty }
-                                resId <- substitute lookupFunc (mType mem)
-                                dtraceM ("getMemberId: nid=" ++ show nid ++ ", fieldName=" ++ show fieldName ++ " -> " ++ show resId)
-                                return (Just resId)
-                            Nothing -> dtrace ("getMemberId: nid=" ++ show nid ++ ", fieldName=" ++ show fieldName ++ " not found") $ return Nothing
-                    Nothing -> dtrace ("getMemberId: tyName=" ++ show tyName ++ " not found in registry") $ return Nothing
+                                        Just actualId          -> return (Just actualId)
+                                        Nothing | isRefinable tid -> skolem tid
+                                        Nothing                -> return Nothing
+                                    -- The same field of the same instance always has the same type.
+                                    key = (inst, tyName, if viaPointer then [] else params, fieldName)
+                                resId <- cached tsMemberTypes (\m s -> s { tsMemberTypes = m }) key $ do
+                                    modify $ \s -> s { tsSubstCache = Map.empty }
+                                    substitute lookupFunc (mType mem)
+                                Just <$> pointerFieldInstance inst fieldName resId
+                            Nothing -> return Nothing
+                    Nothing -> return Nothing
 
             Just (AnyRigidNodeF (RObject (VExistential tids bodyId) _)) -> do
-                dtraceM ("getMemberId: unpacking existential for nid=" ++ show nid)
-                let lookupFunc tid = case findIndex (== tid) tids of
-                        Just idx -> do
-                            let tid' = TIdSkolem nid nid (fromIntegral idx)
-                            resId <- register $ AnyRigidNodeF (RObject (VVar tid' Nothing) (Quals False False))
-                            return (Just resId)
-                        Nothing -> return Nothing
-                modify $ \s -> s { tsSubstCache = Map.empty }
-                unpackedId <- substitute lookupFunc bodyId
-                getMemberId reg unpackedId fieldName
+                let lookupFunc tid = if tid `elem` tids then skolem tid else return Nothing
+                unpackedId <- cached tsUnpacked (\m s -> s { tsUnpacked = m }) (inst, bodyId) $ do
+                    modify $ \s -> s { tsSubstCache = Map.empty }
+                    substitute lookupFunc bodyId
+                memberOf reg inst False unpackedId fieldName
 
-            Just (AnyRigidNodeF (RObject (VVar tid _) _)) -> do
-                dtraceM ("getMemberId: nid=" ++ show nid ++ " is VVar " ++ show tid ++ " and lookThroughVariables returned it (no target)")
-                return Nothing
+            Just (AnyRigidNodeF (RReference (Ptr (TargetObject nid')) _ _ _)) ->
+                memberOf reg inst True nid' fieldName
 
-            Just (AnyRigidNodeF (RReference (Ptr (TargetObject nid')) _ _ _)) -> do
-                dtraceM ("getMemberId: following pointer nid=" ++ show nid ++ " -> target=" ++ show nid')
-                getMemberId reg nid' fieldName
+            _ -> return Nothing
 
-            Just node -> dtrace ("getMemberId: nid=" ++ show nid ++ " has unexpected node type: " ++ show node) $ return Nothing
-            Nothing -> dtrace ("getMemberId: nid=" ++ show nid ++ " not found in tsNodes") $ return Nothing
+-- | Parameter @tid@ of the struct instance @inst@, read through a pointer.
+instanceSkolem :: Word32 -> TemplateId -> State TranslatorState Word32
+instanceSkolem inst tid = cached tsSkolems (\m s -> s { tsSkolems = m }) (inst, tid) $
+    register $ AnyRigidNodeF (RObject (VVar (TIdSkolem inst inst (fromIntegral (Data.Hashable.hash tid))) Nothing) (Quals False False))
+
+-- | Looks a result up in one of the translator's caches, or makes and keeps it.
+cached :: Ord k => (TranslatorState -> Map k Word32) -> (Map k Word32 -> TranslatorState -> TranslatorState) -> k -> State TranslatorState Word32 -> State TranslatorState Word32
+cached getCache setCache key make = do
+    st <- get
+    case Map.lookup key (getCache st) of
+        Just nid -> return nid
+        Nothing -> do
+            nid <- make
+            modify $ \s -> setCache (Map.insert key nid (getCache s)) s
+            return nid
+
+-- | Records a call like @p->cb(p->userdata)@, which passes a struct's own
+-- data to its own callback: every instance of the struct must allow it, not
+-- only @p@, so it's checked on each of them after collection.
+recordStructCalls :: Registry Word32 -> PathContext -> Node (Lexeme Text) -> [Node (Lexeme Text)] -> State TranslatorState ()
+recordStructCalls reg ctx func args = case accessOf func of
+    Just (base, f) | Just basePath <- matchObjPath base -> do
+        mObjId <- collectRefinements reg ctx base
+        st <- get
+        let calls = [ (name, C.lexemeText f, k, C.lexemeText g)
+                    | Just name <- [mObjId >>= getObjectTypeName st]
+                    , (k, arg) <- zip [0..] args
+                    , Just (argBase, g) <- [accessOf arg]
+                    , matchObjPath argBase == Just basePath
+                    ]
+        modify $ \s -> s { tsStructCalls = calls ++ tsStructCalls s }
+    _ -> return ()
+  where
+    accessOf (Fix (CimpleNode (C.PointerAccess b l))) = Just (b, l)
+    accessOf (Fix (CimpleNode (C.MemberAccess b l)))  = Just (b, l)
+    accessOf _                                        = Nothing
+
+-- | Checks each recorded struct call on every instance of its struct, as if
+-- the instance made the call itself. Only instances that use both fields can
+-- break it: on any other, one side is unconstrained.
+applyStructCalls :: Registry Word32 -> State TranslatorState ()
+applyStructCalls reg = do
+    st <- get
+    let ctx = PathContext Map.empty Map.empty
+        uses inst field = Set.member (inst, field) (tsAccessedFields st)
+    forM_ (nubOrd (tsStructCalls st)) $ \(name, f, k, g) ->
+        forM_ (filter (\inst -> uses inst f && uses inst g) (Map.keys (Map.findWithDefault Map.empty name (tsStructInstances st)))) $ \inst -> do
+            mFuncId <- getMemberId reg inst f
+            mArgId <- getMemberId reg inst g
+            mFunc <- maybe (return Nothing) lookThroughVariables mFuncId
+            case (mFunc, mArgId) of
+                (Just (AnyRigidNodeF (RReference (Ptr (TargetFunction paramIds ret)) _ _ _)), Just argId) | k < length paramIds -> do
+                    (paramIds', _, nodeMapping) <- refreshSignature paramIds ret
+                    _ <- Map.traverseWithKey (\origId freshId -> modify (addInherit Nothing freshId origId)) nodeMapping
+                    case drop k paramIds' of
+                        paramId : _ -> linkArgument Nothing ctx paramId argId
+                        []          -> return ()
+                _ -> return ()
+
+-- | A field that points to a struct is its own instance, the same one each
+-- time it's read from the same instance, so @x->inner->cb@ and
+-- @x->inner->userdata@ agree, and @y->inner@ is another.
+pointerFieldInstance :: Word32 -> Text -> Word32 -> State TranslatorState Word32
+pointerFieldInstance inst fieldName resId = do
+    st <- get
+    let pointsToStruct = case Map.lookup resId (tsNodes st) of
+            Just (AnyRigidNodeF (RReference (Ptr (TargetObject t)) _ _ _)) -> case Map.lookup t (tsNodes st) of
+                Just (AnyRigidNodeF (RObject VNominal{} _))     -> True
+                Just (AnyRigidNodeF (RObject VExistential{} _)) -> True
+                _                                               -> False
+            _ -> False
+    case Map.lookup (inst, fieldName) (tsFieldInstances st) of
+        Just fieldInst -> return fieldInst
+        Nothing | pointsToStruct -> do
+            fieldInst <- register $ AnyRigidNodeF (RObject (VVar (TIdInstance (toInteger (tsNextId st))) Nothing) (Quals False False))
+            modify $ \s -> (addConstraint Nothing (PathContext Map.empty Map.empty) fieldInst resId s)
+                { tsFieldInstances = Map.insert (inst, fieldName) fieldInst (tsFieldInstances s) }
+            return fieldInst
+        Nothing -> return resId
 
 hardenCall :: Text -> [Word32] -> [Maybe Word32] -> ReturnType Word32 -> Maybe (Lexeme Text) -> PathContext -> State TranslatorState ()
 hardenCall name paramIds argIds ret loc ctx = do

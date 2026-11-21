@@ -11,6 +11,7 @@ import           Data.Word                                 (Word32)
 import qualified Language.Cimple                           as C
 import           Language.Hic.Refined.Inference.Translator
 import           Language.Hic.Refined.Inference.Types
+import           Language.Hic.Refined.Registry
 import           Language.Hic.Refined.Types
 import qualified Language.Hic.TypeSystem.Core.Base         as TS
 import           Test.Hspec
@@ -86,6 +87,85 @@ spec = do
                 Just (AnyRigidNodeF (RObject (VNominal l _) _)) ->
                     C.lexemeText l `shouldBe` TIdName baseName
                 _ -> expectationFailure "Expected nid to be a VNominal"
+
+    describe "translateRegistry" $ do
+        let param i = TS.TIdParam i Nothing TS.TopLevel
+            field name ty = (dummyL name, ty)
+            ref name args = TS.TypeRef TS.StructRef (dummyL (TS.TIdName name)) (map (`TS.Template` Nothing) args)
+            struct name ps ms = (name, TS.StructDescr (dummyL name) ps ms [])
+            -- The type system gives Outer the parameter of the Inner it points to.
+            ts = Map.fromList
+                [ struct "Inner" [param 0] [field "data" (TS.Pointer (TS.Template (param 0) Nothing))]
+                , struct "Outer" [param 0, param 1]
+                    [ field "data" (TS.Pointer (TS.Template (param 0) Nothing))
+                    , field "inner" (TS.Pointer (ref "Inner" [param 1]))
+                    ]
+                , struct "Holder" [param 0] [field "inner" (ref "Inner" [param 0])]
+                ]
+            params name st = case Map.lookup name (regDefinitions (fst st)) of
+                Just (StructDef _ ps _) -> map fst ps
+                _                       -> error ("no struct " ++ show name)
+            translated = runState (translateRegistry ts) (emptyTranslatorState ts)
+
+        it "gives a struct only the parameters of its own storage" $ do
+            params "Outer" translated `shouldBe` [translateTemplateIdGlobal (param 0)]
+
+        it "keeps the parameters of a struct held by value" $ do
+            params "Holder" translated `shouldBe` [translateTemplateIdGlobal (param 0)]
+
+        it "gives a struct behind a pointer no arguments" $ do
+            let (nid, st) = runState (translateType (TS.Pointer (ref "Inner" [param 2]))) (snd translated)
+            case Map.lookup nid (tsNodes st) of
+                Just (AnyRigidNodeF (RReference (Ptr (TargetObject o)) _ _ _)) -> case Map.lookup o (tsNodes st) of
+                    Just (AnyRigidNodeF (RObject (VNominal _ args) _)) -> args `shouldBe` []
+                    other -> expectationFailure $ "Expected a VNominal, got " ++ show other
+                other -> expectationFailure $ "Expected a pointer, got " ++ show other
+
+        it "takes a reference with fewer arguments than parameters as to any instance" $ do
+            -- What the type system gives a reference inside a group of types
+            -- that refer to each other.
+            let (nid, st) = runState (translateType (ref "Outer" [param 2])) (snd translated)
+            case Map.lookup nid (tsNodes st) of
+                Just (AnyRigidNodeF (RObject (VNominal _ args) _)) -> args `shouldBe` []
+                _ -> expectationFailure "Expected a VNominal"
+
+        it "drops the arguments of a struct's parameters that aren't its own" $ do
+            let (nid, st) = runState (translateType (ref "Outer" [param 2, param 3])) (snd translated)
+            case Map.lookup nid (tsNodes st) of
+                Just (AnyRigidNodeF (RObject (VNominal _ args) _)) -> length args `shouldBe` 1
+                _ -> expectationFailure "Expected a VNominal"
+
+    describe "translateType (Function Pointers)" $ do
+        it "gives a pointer to a function typedef the reference's arguments" $ do
+            -- typedef void cb(void *data); and a cb * whose data is param 5.
+            let own = TS.TIdParam 0 Nothing TS.TopLevel
+                arg = TS.TIdParam 5 Nothing TS.TopLevel
+                cbTy = TS.FuncDescr (dummyL "cb") [own] (TS.BuiltinType TS.VoidTy) [TS.Template own Nothing]
+                ts = Map.singleton "cb" cbTy
+                ref = TS.Pointer (TS.TypeRef TS.FuncRef (dummyL (TS.TIdName "cb")) [TS.Template arg Nothing])
+                (nid, st) = runState (translateType ref) (emptyTranslatorState ts)
+            case Map.lookup nid (tsNodes st) of
+                Just (AnyRigidNodeF (RReference (Ptr (TargetFunction [a] _)) _ _ _)) ->
+                    Map.lookup a (tsNodes st) `shouldBe` Just (AnyRigidNodeF (RObject (VVar (translateTemplateIdGlobal arg) Nothing) (Quals False False)))
+                other -> expectationFailure $ "Expected a function pointer, got " ++ show other
+
+        it "pairs a function typedef reference's arguments with its own parameters" $ do
+            -- typedef void cb(struct S *s, void *data); where S<a> gives cb
+            -- the parameter a, and the reference has an argument for data only.
+            let a = TS.TIdParam 0 Nothing TS.TopLevel
+                own = TS.TIdParam 1 Nothing TS.TopLevel
+                arg = TS.TIdParam 5 Nothing TS.TopLevel
+                sRef = TS.TypeRef TS.StructRef (dummyL (TS.TIdName "S")) [TS.Template a Nothing]
+                ts = Map.fromList
+                    [ ("S", TS.StructDescr (dummyL "S") [a] [(dummyL "x", TS.Pointer (TS.Template a Nothing))] [])
+                    , ("cb", TS.FuncDescr (dummyL "cb") [a, own] (TS.BuiltinType TS.VoidTy) [TS.Pointer sRef, TS.Template own Nothing])
+                    ]
+                ref' = TS.Pointer (TS.TypeRef TS.FuncRef (dummyL (TS.TIdName "cb")) [TS.Template arg Nothing])
+                (nid, st) = runState (translateRegistry ts >> translateType ref') (emptyTranslatorState ts)
+            case Map.lookup nid (tsNodes st) of
+                Just (AnyRigidNodeF (RReference (Ptr (TargetFunction [_, d] _)) _ _ _)) ->
+                    Map.lookup d (tsNodes st) `shouldBe` Just (AnyRigidNodeF (RObject (VVar (translateTemplateIdGlobal arg) Nothing) (Quals False False)))
+                other -> expectationFailure $ "Expected a function pointer, got " ++ show other
 
     describe "translateType (Array Elements)" $ do
         it "favors existential types for array elements" $ do

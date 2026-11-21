@@ -9,7 +9,8 @@ module Language.Hic.TypeSystem.Core.Transition
 
 import           Data.Fix                                         (Fix (..))
 import           Data.Functor                                     (void)
-import           Data.Maybe                                       (fromMaybe)
+import           Data.Maybe                                       (fromMaybe,
+                                                                   isNothing)
 import           Data.Set                                         (Set)
 import qualified Data.Set                                         as Set
 import           Data.Text                                        (Text)
@@ -32,6 +33,7 @@ import           Language.Hic.TypeSystem.Core.Qualification       (Constness (..
                                                                    QualState (..),
                                                                    allowCovariance,
                                                                    fromQuals,
+                                                                   shield,
                                                                    stepQual,
                                                                    toQuals)
 import           Language.Hic.TypeSystem.Core.Transition.Atoms
@@ -62,7 +64,7 @@ toValueStructure structure n o = case structure of
     PointerF a        -> Just $ VPointer a n o
     BuiltinTypeF s    -> Just $ VBuiltin s
     ExternalTypeF l   -> Just $ VExternal l
-    ArrayF m ds       -> Just $ VArray m ds
+    ArrayF m ds       -> Just $ VArray m ds n o
     TemplateF ft      -> Just $ VTemplate ft n o
     SingletonF s i    -> Just $ VSingleton s i
     IntLitF l         -> Just $ VIntLit l
@@ -88,7 +90,12 @@ fromValueNode' f r ps c s =
 fromValueNode :: (a -> TypeInfo p) -> ValueStructure (TemplateId p) a -> Constness -> Maybe (Lexeme (TemplateId p)) -> TypeInfo p
 fromValueNode f v c s =
     let (base, n, o) = fromValueStructure f v
-        qs = fromQuals n o c
+        -- Non-null is an array's default ('toFlat'): one that may be null
+        -- says so.
+        qs = case (v, n) of
+            (VArray{}, QNonnull')    -> fromQuals QUnspecified o c
+            (VArray{}, QUnspecified) -> Set.insert QNullUnspecified (fromQuals QUnspecified o c)
+            _                        -> fromQuals n o c
         withQuals = if Set.null qs then base else Fix (QualifiedF qs base)
     in maybe withQuals (Fix . SizedF withQuals) s
 
@@ -98,7 +105,7 @@ fromValueStructure f = \case
     VPointer a n o   -> (Fix (PointerF (f a)), n, o)
     VTemplate ft n o -> (Fix (TemplateF (fmap f ft)), n, o)
     VTypeRef r l as  -> (Fix (TypeRefF r l (map f as)), QUnspecified, QNonOwned')
-    VArray m ds      -> (Fix (ArrayF (fmap f m) (map f ds)), QUnspecified, QNonOwned')
+    VArray m ds n o  -> (Fix (ArrayF (fmap f m) (map f ds)), n, o)
     VSingleton s i   -> (Fix (SingletonF s i), QUnspecified, QNonOwned')
     VExternal l      -> (Fix (ExternalTypeF l), QUnspecified, QNonOwned')
     VIntLit l        -> (Fix (IntLitF l), QUnspecified, QNonOwned')
@@ -134,7 +141,13 @@ stepTransition :: (Eq tid, Show tid, Eq a, Show a, Ord a)
                -> RigidNodeF tid a
                -> RigidNodeF tid (a, a, ProductState)
 stepTransition ps lookupNode getQuals terminals identical nL nR =
-    let res = step ps lookupNode getQuals terminals identical nL nR
+    -- A level that is 'const' is shielded, if all levels above it are: the
+    -- state a walk down to it gives. A join with a side that is 'const' is
+    -- 'const', so both sides are.
+    let joinedConst = psPolarity ps == PJoin && QConst' `elem` [nodeQual nL, nodeQual nR]
+        constState n q = if nodeQual n == QConst' || joinedConst then fromMaybe q (shield q) else q
+        ps' = ps { psQualL = constState nL (psQualL ps), psQualR = constState nR (psQualR ps) }
+        res = step ps' lookupNode getQuals terminals identical nL nR
     in dtrace ("stepTransition: ps=" ++ show ps ++ " nL=" ++ show (void nL) ++ " nR=" ++ show (void nR) ++ " -> res=" ++ show (void res)) res
 
 step :: (Eq tid, Show tid, Eq a, Show a, Ord a)
@@ -151,7 +164,19 @@ step ps@ProductState{..} lookupNode getQuals terminals isStrictlyIdentical nL nR
     | isIdentityFor psPolarity nR = stepSpecial ps getQuals terminals nL False
     | isZeroFor psPolarity nL || isZeroFor psPolarity nR = zero ps
     | otherwise = case (nL, nR) of
-        (RValue vL cL sL, RValue vR cR sR) ->
+        (RValue vL cL sL, RValue vR cR sR)
+            -- At a level that isn't 'const' inside a pointer, a side must be
+            -- the same as the result ('sameLevel'). A join where it isn't
+            -- holds both by making the level 'const', if all levels above it
+            -- are; else nothing does, as nothing but bottom is below both in
+            -- a meet.
+            | not psForceConst
+            , psPolarity == PMeet || max cL cR == QMutable'
+            , not (levelFits (void vL) psQualL && levelFits (void vR) psQualR) ->
+                case (psPolarity, shield psQualL, shield psQualR) of
+                    (PJoin, Just qL, Just qR) -> step ps { psQualL = qL, psQualR = qR, psForceConst = True } lookupNode getQuals terminals isStrictlyIdentical nL nR
+                    _                         -> zero ps
+            | otherwise ->
             case stepValueStructure ps lookupNode getQuals terminals cL cR vL vR of
                 Just (resV, _, _) ->
                     let resC = case psPolarity of { PJoin -> max cL cR; PMeet -> min cL cR }
@@ -188,6 +213,25 @@ step ps@ProductState{..} lookupNode getQuals terminals isStrictlyIdentical nL nR
                    else RFunction (rL, rR, psRes) (zipWith (\l r -> (l, r, psContra)) pL pR) resC' resS
 
         _ -> zero ps
+  where
+    combined = case (nL, nR) of
+        (RValue vL cL _, RValue vR cR _) -> (\(resV, _, _) -> void resV) <$> stepValueStructure ps lookupNode getQuals terminals cL cR vL vR
+        _                                -> Nothing
+    levelFits v q
+        | allowCovariance q = True
+        | otherwise = case combined of
+            Nothing  -> False
+            Just res -> if psPolarity == PJoin then sameLevel v res else sameLevel res v
+
+-- | Whether a node is the same as another at a level that isn't 'const', as
+-- 'Language.Hic.TypeSystem.Core.Subtype' takes it there: the same, a value of
+-- its builtin type, or an array of a pointer with its nullability and
+-- ownership.
+sameLevel :: (Eq tid) => ValueStructure tid () -> ValueStructure tid () -> Bool
+sameLevel a b = a == b || case (a, b) of
+    (VSingleton s _, VBuiltin t)       -> s == t
+    (VArray _ _ n o, VPointer _ n' o') -> n == n' && o == o'
+    _                                  -> False
 
 -- | Handles stepping through an identity node (Unconstrained in Join, Conflict in Meet).
 -- This ensures that the identity acts as a neutral element even inside structures.
@@ -205,8 +249,8 @@ stepSpecial ps getQuals terminals n isLeft =
         ident = if psPolarity ps == PJoin then fst terminals else snd terminals
     in fmap (\child ->
         let (ps', _) = if isLeft
-                       then getTargetState ps terminals getQuals QMutable' c ident child
-                       else getTargetState ps terminals getQuals c QMutable' child ident
+                       then getTargetState ps (== ident) getQuals QMutable' c ident child
+                       else getTargetState ps (== ident) getQuals c QMutable' child ident
             resPs = if isLeft then ps' { psQualL = QualTop } else ps' { psQualR = QualTop }
             resTriple = if isLeft then (ident, child, resPs) else (child, ident, resPs)
         in resTriple) n'
@@ -229,30 +273,44 @@ stepValueStructure :: (Eq tid, Eq a, Show a, Ord a)
 stepValueStructure ps@ProductState{..} lookupNode getQuals terminals cL cR sL sR =
     let bot = fst terminals
         top = snd terminals
-        
+
         isNodeIdentity t tgt = t == tgt || case lookupNode t of
-            Just (RSpecial SUnconstrained) -> tgt == fst terminals
-            Just (RSpecial SConflict)      -> tgt == snd terminals
+            Just (RSpecial SUnconstrained)      -> tgt == fst terminals
+            Just (RSpecial SConflict)           -> tgt == snd terminals
             Just (RValue (VTemplate _ _ _) _ _) -> t == tgt
-            Just (RValue (VSingleton _ _) _ _) -> t == tgt
-            Just (RValue (VBuiltin _) _ _) -> t == tgt
-            Just (RValue (VIntLit _) _ _) -> t == tgt
-            Just (RValue (VNameLit _) _ _) -> t == tgt
-            Just (RValue (VEnumMem _) _ _) -> t == tgt
-            Just (RValue (VVarArg) _ _) -> t == tgt
-            Just (RValue (VExternal _) _ _) -> t == tgt
-            Just (RValue (VTypeRef _ _ _) _ _) -> t == tgt
-            Just (RFunction _ _ _ _) -> t == tgt
-            _ -> False
+            Just (RValue (VSingleton _ _) _ _)  -> t == tgt
+            Just (RValue (VBuiltin _) _ _)      -> t == tgt
+            Just (RValue (VIntLit _) _ _)       -> t == tgt
+            Just (RValue (VNameLit _) _ _)      -> t == tgt
+            Just (RValue (VEnumMem _) _ _)      -> t == tgt
+            Just (RValue (VVarArg) _ _)         -> t == tgt
+            Just (RValue (VExternal _) _ _)     -> t == tgt
+            Just (RValue (VTypeRef _ _ _) _ _)  -> t == tgt
+            Just (RFunction _ _ _ _)            -> t == tgt
+            _                                   -> False
 
         isIdentity t = isNodeIdentity t (if psPolarity == PJoin then bot else top)
         isNeutral' t = isIdentity t
         isTerminal' t = isNodeIdentity t bot || isNodeIdentity t top
+        -- Targets with no type in common even where they may differ: their
+        -- join is Conflict, which is above both wherever it is, so the level
+        -- above needn't be the same on both sides. Where they may differ,
+        -- their own targets can always be joined, so this looks no deeper.
+        clash tL tR = psPolarity == PJoin && case (lookupNode tL, lookupNode tR) of
+            (Just (RValue a cA _), Just (RValue b cB _)) ->
+                isNothing (stepValueStructure free lookupNode getQuals terminals cA cB a b)
+            (Just RFunction{}, Just RValue{}) -> True
+            (Just RValue{}, Just RFunction{}) -> True
+            _ -> False
+        free = ps { psQualL = QualTop, psQualR = QualTop, psForceConst = False }
+        targetState tL tR =
+            let (resState, canJoin) = getTargetState ps isTerminal' getQuals cL cR tL tR
+            in (resState, canJoin || clash tL tR)
     in case mergeAtoms ps sL sR of
         Just (res, identL, identR) -> Just (fmap (\x -> (x, x, ps)) res, identL, identR)
         Nothing -> case (sL, sR) of
             (VPointer tL nL oL, VPointer tR nR oR) ->
-                let (resState, canJoin) = getTargetState ps terminals getQuals cL cR tL tR
+                let (resState, canJoin) = targetState tL tR
                     resN = case psPolarity of { PJoin -> max nL nR; PMeet -> min nL nR }
                     resO = case psPolarity of { PJoin -> max oL oR; PMeet -> min oL oR }
                     identL = tL == tR || isTerminal' tL || isNeutral' tR
@@ -260,34 +318,36 @@ stepValueStructure ps@ProductState{..} lookupNode getQuals terminals cL cR sL sR
                 in if canJoin then Just (VPointer (tL, tR, resState) resN resO, identL, identR)
                    else Nothing
 
-            (VPointer tL nullL oL, VArray mR dsR) ->
+            (VPointer tL nullL oL, VArray mR dsR nullR oR) ->
                 let tR = fromMaybe bot mR
-                    (resState, canJoin) = getTargetState ps terminals getQuals cL cR tL tR
-                    resN = case psPolarity of { PJoin -> max nullL QUnspecified; PMeet -> min nullL QUnspecified }
-                    resO = case psPolarity of { PJoin -> max oL QNonOwned'; PMeet -> min oL QNonOwned' }
+                    (resState, canJoin) = targetState tL tR
+                    resN = case psPolarity of { PJoin -> max nullL nullR; PMeet -> min nullL nullR }
+                    resO = case psPolarity of { PJoin -> max oL oR; PMeet -> min oL oR }
                     identL = (tL == tR || isTerminal' tL || isNeutral' tR) && null dsR
                     identR = (tR == tL || isTerminal' tR || isNeutral' tL) && null dsR
                 in if canJoin then case psPolarity of
                     PJoin -> Just (VPointer (tL, tR, resState) resN resO, identL, identR)
-                    PMeet -> Just (VArray (Just (tL, tR, resState)) (map (\r -> (top, r, ps { psQualL = QualTop, psQualR = QualTop })) dsR), identL, False)
+                    PMeet -> Just (VArray (Just (tL, tR, resState)) (map (\r -> (top, r, ps { psQualL = QualTop, psQualR = QualTop })) dsR) resN resO, identL, False)
                    else Nothing
 
-            (VArray mL dsL, VPointer tR nullR oR) ->
+            (VArray mL dsL nullL oL, VPointer tR nullR oR) ->
                 let tL = fromMaybe bot mL
-                    (resState, canJoin) = getTargetState ps terminals getQuals cL cR tL tR
-                    resN = case psPolarity of { PJoin -> max QUnspecified nullR; PMeet -> min QUnspecified nullR }
-                    resO = case psPolarity of { PJoin -> max QNonOwned' oR; PMeet -> min QNonOwned' oR }
+                    (resState, canJoin) = targetState tL tR
+                    resN = case psPolarity of { PJoin -> max nullL nullR; PMeet -> min nullL nullR }
+                    resO = case psPolarity of { PJoin -> max oL oR; PMeet -> min oL oR }
                     identL = (tL == tR || isTerminal' tL || isNeutral' tR) && null dsL
                     identR = (tR == tL || isTerminal' tR || isNeutral' tL) && null dsL
                 in if canJoin then case psPolarity of
                     PJoin -> Just (VPointer (tL, tR, resState) resN resO, identL, identR)
-                    PMeet -> Just (VArray (Just (tL, tR, resState)) (map (\l -> (l, top, ps { psQualL = QualTop, psQualR = QualTop })) dsL), identL, False)
+                    PMeet -> Just (VArray (Just (tL, tR, resState)) (map (\l -> (l, top, ps { psQualL = QualTop, psQualR = QualTop })) dsL) resN resO, identL, False)
                    else Nothing
 
-            (VArray mL dsL, VArray mR dsR) ->
+            (VArray mL dsL nullL oL, VArray mR dsR nullR oR) ->
                 let tL = fromMaybe bot mL
                     tR = fromMaybe bot mR
-                    (resState, canJoin) = getTargetState ps terminals getQuals cL cR tL tR
+                    resN = case psPolarity of { PJoin -> max nullL nullR; PMeet -> min nullL nullR }
+                    resO = case psPolarity of { PJoin -> max oL oR; PMeet -> min oL oR }
+                    (resState, canJoin) = targetState tL tR
                     isNeutralL = isNeutral' tL
                     isNeutralR = isNeutral' tR
                     isTermL = isTerminal' tL
@@ -300,7 +360,7 @@ stepValueStructure ps@ProductState{..} lookupNode getQuals terminals cL cR sL sR
                             resM = case (mL, mR) of { (Nothing, Nothing) -> Nothing; _ -> Just (tL, tR, resState) }
                             identL = (tL == tR || isTermL || isNeutralR) && (length dsL == length dsR || null dsL)
                             identR = (tR == tL || isTermR || isNeutralL) && (length dsL == length dsR || null dsR)
-                        in Just (VArray resM resDs, identL, identR)
+                        in Just (VArray resM resDs resN resO, identL, identR)
                     PMeet ->
                         let resDs = if null dsL then map (\r -> (top, r, ps { psQualL = QualTop, psQualR = QualTop })) dsR
                                     else if null dsR then map (\l -> (l, top, ps { psQualL = QualTop, psQualR = QualTop })) dsL
@@ -310,12 +370,12 @@ stepValueStructure ps@ProductState{..} lookupNode getQuals terminals cL cR sL sR
                             identL = (tL == tR || isTermL || isNeutralR) && (null dsR || length dsL == length dsR)
                             identR = (tR == tL || isTermR || isNeutralL) && (null dsL || length dsL == length dsR)
                         in if null dsL || null dsR || length dsL == length dsR
-                           then Just (VArray resM resDs, identL, identR)
+                           then Just (VArray resM resDs resN resO, identL, identR)
                            else Nothing
 
             -- nullptr_t vs Pointer/Array
             (vL, VPointer tR nullR oR) | isNull vL ->
-                let (resState, _) = getTargetState ps terminals getQuals cL cR bot tR
+                let (resState, _) = getTargetState ps isTerminal' getQuals cL cR bot tR
                 in case psPolarity of
                     -- NullPtrTy <= Pointer (when not Nonnull), so join uses max with QUnspecified
                     PJoin -> Just (VPointer (bot, tR, resState) (max QUnspecified nullR) oR, False, True)
@@ -324,34 +384,33 @@ stepValueStructure ps@ProductState{..} lookupNode getQuals terminals cL cR sL sR
                              else Nothing
 
             (VPointer tL nullL oL, vR) | isNull vR ->
-                let (resState, _) = getTargetState ps terminals getQuals cL cR tL bot
+                let (resState, _) = getTargetState ps isTerminal' getQuals cL cR tL bot
                 in case psPolarity of
                     PJoin -> Just (VPointer (tL, bot, resState) (max nullL QUnspecified) oL, True, False)
                     PMeet -> if allowCovariance psQualL && nullL /= QNonnull'
                              then Just (fmap (\x -> (x, x, ps)) vR, False, True)
                              else Nothing
 
-            (vL, VArray mR dsR) | isNull vL ->
+            -- An array that may be null takes nullptr like a pointer.
+            (vL, VArray mR dsR nullR oR) | isNull vL ->
                 let tR = fromMaybe bot mR
-                    (resState, _) = getTargetState ps terminals getQuals cL cR bot tR
+                    (resState, _) = getTargetState ps isTerminal' getQuals cL cR bot tR
                     dimState = resState { psQualL = QualTop, psQualR = QualTop }
                 in case psPolarity of
-                    -- NullPtrTy <= Array, so join returns the Array side
                     PJoin -> Just (VArray (fmap (\t -> (bot, t, resState)) mR)
-                                         (map (\d -> (bot, d, dimState)) dsR), False, True)
-                    PMeet -> if allowCovariance psQualR
+                                         (map (\d -> (bot, d, dimState)) dsR) (max QUnspecified nullR) oR, False, True)
+                    PMeet -> if allowCovariance psQualR && nullR /= QNonnull'
                              then Just (fmap (\x -> (x, x, ps)) vL, True, False)
                              else Nothing
 
-            (VArray mL dsL, vR) | isNull vR ->
+            (VArray mL dsL nullL oL, vR) | isNull vR ->
                 let tL = fromMaybe bot mL
-                    (resState, _) = getTargetState ps terminals getQuals cL cR tL bot
+                    (resState, _) = getTargetState ps isTerminal' getQuals cL cR tL bot
                     dimState = resState { psQualL = QualTop, psQualR = QualTop }
                 in case psPolarity of
-                    -- NullPtrTy <= Array, so join returns the Array side
                     PJoin -> Just (VArray (fmap (\t -> (t, bot, resState)) mL)
-                                         (map (\d -> (d, bot, dimState)) dsL), True, False)
-                    PMeet -> if allowCovariance psQualL
+                                         (map (\d -> (d, bot, dimState)) dsL) (max nullL QUnspecified) oL, True, False)
+                    PMeet -> if allowCovariance psQualL && nullL /= QNonnull'
                              then Just (fmap (\x -> (x, x, ps)) vR, False, True)
                              else Nothing
 
@@ -366,7 +425,7 @@ zipValueStructures (VBuiltin s) (VBuiltin _) = VBuiltin s
 zipValueStructures (VPointer a n o) (VPointer b _ _) = VPointer (a, b) n o
 zipValueStructures (VTemplate ft n o) (VTemplate ft2 _ _) = VTemplate (zipFT ft ft2) n o
 zipValueStructures (VTypeRef r l as1) (VTypeRef _ _ as2) = VTypeRef r l (zip as1 as2)
-zipValueStructures (VArray m1 ds1) (VArray m2 ds2) = VArray (zipWithMaybe (,) m1 m2) (zip ds1 ds2)
+zipValueStructures (VArray m1 ds1 n o) (VArray m2 ds2 _ _) = VArray (zipWithMaybe (,) m1 m2) (zip ds1 ds2) n o
 zipValueStructures (VSingleton s i) (VSingleton _ _) = VSingleton s i
 zipValueStructures (VExternal l) (VExternal _) = VExternal l
 zipValueStructures (VIntLit l) (VIntLit _) = VIntLit l

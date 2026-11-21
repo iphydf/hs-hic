@@ -41,7 +41,7 @@ module Language.Hic.TypeSystem.Core.TypeGraph
     )
 where
 
-import           Control.Applicative                            ((<|>))
+import           Control.Applicative                           ((<|>))
 import           Control.Monad                                 (when)
 import           Control.Monad.State.Strict                    (get, modify,
                                                                 put, runState,
@@ -67,7 +67,8 @@ import qualified Language.Hic.TypeSystem.Core.Base             as TS
 import           Language.Hic.TypeSystem.Core.Qualification    (Constness (..),
                                                                 Nullability (..),
                                                                 Ownership (..),
-                                                                QualState (..))
+                                                                QualState (..),
+                                                                stackNullability)
 import           Language.Hic.TypeSystem.Core.Transition       (Polarity (..),
                                                                 ProductState (..),
                                                                 RigidNodeF (..),
@@ -75,7 +76,8 @@ import           Language.Hic.TypeSystem.Core.Transition       (Polarity (..),
                                                                 ValueStructure (..),
                                                                 fromRigid,
                                                                 stepTransition,
-                                                                toRigid)
+                                                                toRigid,
+                                                                valueQuals)
 import qualified Language.Hic.TypeSystem.Core.Transition.Atoms as Transition
 
 --------------------------------------------------------------------------------
@@ -119,7 +121,7 @@ identifyNeutralNodes pol nodes =
             in if new == seen then seen else step new
         isNeutral seen = \case
             RValue (VPointer r _ _) _ _ -> r `IntSet.member` seen
-            RValue (VArray m ds) _ _ -> maybe True (`IntSet.member` seen) m && all (`IntSet.member` seen) ds
+            RValue (VArray m ds _ _) _ _ -> maybe True (`IntSet.member` seen) m && all (`IntSet.member` seen) ds
             RFunction r ps _ _ -> r `IntSet.member` seen && all (`IntSet.member` seen) ps
             RSpecial s -> Transition.isIdentityFor pol (RSpecial s)
             _ -> False
@@ -195,9 +197,7 @@ productConstruction isVar startPol g1 g2 =
 
         hasIdentityQuals pol n =
             let (nullability, ownership, constness) = case n of
-                    RValue (VPointer _ n' o') c' _ -> (n', o', c')
-                    RValue (VTemplate _ n' o') c' _ -> (n', o', c')
-                    RValue _ c' _ -> (QUnspecified, QNonOwned', c')
+                    RValue v c' _ -> let (n', o') = valueQuals v in (n', o', c')
                     RFunction _ _ c' _ -> (QUnspecified, QNonOwned', c')
                     _ -> (QUnspecified, QNonOwned', QMutable')
             in case pol of
@@ -206,8 +206,8 @@ productConstruction isVar startPol g1 g2 =
 
         allStates = [ ProductState pol qL qR fc
                     | pol <- [PJoin, PMeet]
-                    , qL <- [QualTop, QualLevel1Const, QualLevel1Mutable, QualShielded, QualUnshielded]
-                    , qR <- [QualTop, QualLevel1Const, QualLevel1Mutable, QualShielded, QualUnshielded]
+                    , qL <- [minBound .. maxBound]
+                    , qR <- [minBound .. maxBound]
                     , fc <- [True, False]
                     ]
 
@@ -228,10 +228,8 @@ productConstruction isVar startPol g1 g2 =
                 n2 = maybeIdentity pol n1Raw j n2Raw
                 lookupNode idx = Just $ getGNode idx (GA.gNodes gMerged)
                 getQuals idx = case getGNode idx (GA.gNodes gMerged) of
-                    RValue (VPointer _ n o) c _ -> (n, o, c)
-                    RValue (VTemplate _ n o) c _ -> (n, o, c)
-                    RValue _ c _ -> (QUnspecified, QNonOwned', c)
-                    _ -> (QUnspecified, QNonOwned', QMutable')
+                    RValue v c _ -> let (n, o) = valueQuals v in (n, o, c)
+                    _            -> (QUnspecified, QNonOwned', QMutable')
                 isStrictlyIdentical = (i == j) || (isDeepNeutral pol i && isDeepNeutral pol j)
             in stepTransition ps lookupNode getQuals (-1, -2) isStrictlyIdentical n1 n2
 
@@ -269,11 +267,12 @@ substitute v vGraph (TypeGraph nodes root) =
                         i' <- mergeVGraph vGraph'
                         -- Propagate qualifiers from the host template node to the
                         -- substitution graph's root so they are not silently dropped.
-                        let applyNO (VPointer a n' o')  = VPointer a (max n n') (max o o')
-                            applyNO (VTemplate ft' n' o') = VTemplate ft' (max n n') (max o o')
-                            applyNO v'                  = v'
+                        let applyNO (VPointer a n' o')  = VPointer a (stackNullability n n') (max o o')
+                            applyNO (VTemplate ft' n' o') = VTemplate ft' (stackNullability n n') (max o o')
+                            applyNO (VArray m ds n' o')   = VArray m ds (stackNullability n n') (max o o')
+                            applyNO other               = other
                             applyQ = \case
-                                RValue v' c' s' -> RValue (applyNO v') (max c c') (s <|> s')
+                                RValue value c' s' -> RValue (applyNO value) (max c c') (s <|> s')
                                 RFunction r ps c' s' -> RFunction r ps (max c c') (s <|> s')
                                 nd -> nd
                         when (i' >= 0) $

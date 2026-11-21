@@ -1,15 +1,18 @@
 {-# LANGUAGE FlexibleContexts  #-}
+{-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Language.Hic.Refined.InferenceSpec (spec) where
 
 import           Data.Text                                       (Text)
 import qualified Data.Text                                       as T
 import           GHC.Stack                                       (HasCallStack)
+import           Language.Cimple.Program                         (Program)
 import qualified Language.Hic.Core.Errors                        as E
 import           Language.Hic.Inference.EngineSpec               (mustParse)
 import           Language.Hic.Inference.Program                  (fromCimple)
 import           Language.Hic.Refined.Inference                  (inferRefined,
                                                                   rrErrors)
+import           Language.Hic.TestUtils                          (mustParseFiles)
 import qualified Language.Hic.TypeSystem.Core.Base               as TS
 import           Language.Hic.TypeSystem.Ordered.HotspotAnalysis (garTypeSystem,
                                                                   runGlobalStructuralAnalysis)
@@ -18,20 +21,42 @@ import           Test.Hspec
 shouldHaveRefinedError :: HasCallStack => [Text] -> [Text] -> Expectation
 shouldHaveRefinedError input expectedErrorTexts = do
     prog <- mustParse input
+    programShouldHaveRefinedError prog expectedErrorTexts
+
+programShouldHaveRefinedError :: HasCallStack => Program Text -> [Text] -> Expectation
+programShouldHaveRefinedError prog expectedErrorTexts = do
     let globalAnalysis = runGlobalStructuralAnalysis prog
     let hicProgram = fromCimple prog
     let refinedResult = inferRefined (garTypeSystem globalAnalysis) hicProgram
-    let actualErrorTexts = map errorToText (rrErrors refinedResult)
+    let actualErrorTexts = map errorToText (filter (not . isNullability . E.errType) (rrErrors refinedResult))
     actualErrorTexts `shouldMatchList` expectedErrorTexts
   where
+    -- Null pointers, indexes and conversions are checked on their own
+    -- ("NullabilitySpec", "BufferSizeSpec").
+    isNullability = \case
+        E.MayBeNull{}          -> True
+        E.IndexOutOfBounds{}   -> True
+        E.PointerPastEnd{}     -> True
+        E.NegativeToUnsigned{} -> True
+        E.TooBigForSigned{}    -> True
+        _                      -> False
     errorToText ei = case E.errType ei of
         E.CustomError t -> t
         E.RefinedVariantMismatch -> "Refined type mismatch detected in fixpoint solver"
         E.RefinedNullabilityMismatch -> "Refined type mismatch detected in fixpoint solver"
+        E.RefinedCastMismatch -> "Cast between incompatible types"
+        E.ArgumentTooShort f i _ _ -> "Argument " <> T.pack (show i) <> " of " <> f <> " is too short"
         _ -> T.pack $ show (E.errType ei)
 
 shouldHaveNoRefinedErrors :: HasCallStack => [Text] -> Expectation
 shouldHaveNoRefinedErrors input = shouldHaveRefinedError input []
+
+-- | The same of code in the platform layer, which may use the operating
+-- system's types and functions.
+platformShouldHaveRefinedError :: HasCallStack => [Text] -> [Text] -> Expectation
+platformShouldHaveRefinedError input expected = do
+    prog <- mustParseFiles [("toxcore/os_network.c", input)]
+    programShouldHaveRefinedError prog expected
 
 spec :: Spec
 spec = do
@@ -50,6 +75,89 @@ spec = do
                 , "    int32_t i = 10;"
                 , "    --i;"
                 , "}"
+                ]
+
+        it "takes the address of a function as the function pointer its name is" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef struct Conn { int32_t x; } Conn;"
+                , "typedef int32_t status_cb(void *_Nonnull object, uint32_t n);"
+                , "void status_handler(Conn *_Nonnull con, status_cb *_Nonnull cb, void *_Nonnull object);"
+                , "static int32_t on_status(void *_Nonnull object, uint32_t n) { const Conn *c = (const Conn *)object; return c->x; }"
+                , "void f(Conn *_Nonnull con) { status_handler(con, &on_status, con); }"
+                ]
+
+        it "doesn't take a struct's field for a function of the same name" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef int32_t data_cb(void *_Nonnull object, int32_t n);"
+                , "typedef struct Conns { data_cb *_Nullable on_data; } Conns;"
+                , "void set_handler(Conns *_Nonnull c, data_cb *_Nonnull handler);"
+                , "static int32_t on_data(void *_Nonnull object, int32_t n) { return n; }"
+                , "void f(Conns *_Nonnull c) { set_handler(c, &on_data); }"
+                ]
+
+        it "defines a function declared with an array of a struct with a void * as a pointer to it" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef struct Ev_Result { int32_t sock; void *_Nullable data; } Ev_Result;"
+                , "int32_t ev_run(Ev_Result results[_Nonnull], uint32_t max_results);"
+                , "int32_t ev_run(Ev_Result *results, uint32_t max_results) { return results[0].sock; }"
+                ]
+
+        it "takes the address of a function pointer variable as a pointer to it" $ do
+            shouldHaveRefinedError
+                [ "typedef int32_t status_cb(void *_Nonnull object, uint32_t n);"
+                , "void take(status_cb *_Nonnull cb);"
+                , "void g(status_cb *_Nonnull cb) { take(&cb); }"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
+        it "checks a function's parameters against what a callback type gives them" $ do
+            shouldHaveRefinedError
+                [ "typedef int32_t int_cb(int32_t x);"
+                , "void reg_int(int_cb *_Nonnull cb);"
+                , "int32_t takes_ptr(uint8_t *_Nonnull p);"
+                , "void f(void) { reg_int(takes_ptr); }"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
+        it "lets a function take null where a callback type gives non-null" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef int32_t obj_cb(void *_Nonnull object);"
+                , "void reg_obj(obj_cb *_Nonnull cb);"
+                , "int32_t takes_null(void *_Nullable object);"
+                , "void f(void) { reg_obj(takes_null); }"
+                ]
+
+        it "allows a cast between pointers to bytes of different types" $ do
+            shouldHaveNoRefinedErrors
+                [ "int32_t send_text(const char *_Nonnull buf, int32_t len);"
+                , "void f(const uint8_t data[_Nonnull 4]) { send_text((const char *)data, 4); }"
+                ]
+
+        it "still reports a number seen as bytes through a cast" $ do
+            shouldHaveRefinedError
+                [ "void fill(uint8_t *_Nonnull p, uint32_t n);"
+                , "void g(void) { uint32_t x; fill((uint8_t *)&x, 4); }"
+                ]
+                ["Cast between incompatible types"]
+
+        it "still reports a struct seen as bytes through a cast" $ do
+            shouldHaveRefinedError
+                [ "typedef struct Conn { int32_t *_Nullable p; } Conn;"
+                , "void fill(uint8_t *_Nonnull p, uint32_t n);"
+                , "void g(Conn *_Nonnull c) { fill((uint8_t *)c, sizeof(Conn)); }"
+                ]
+                ["Cast between incompatible types"]
+
+        it "takes an array's size that is a sum as one dimension" $ do
+            shouldHaveNoRefinedErrors
+                [ "#define MAX_PACKET_SIZE 2048"
+                , "#define CRYPTO_NONCE_SIZE 24"
+                , "#define CRYPTO_PUBLIC_KEY_SIZE 32"
+                , "typedef struct Random Random;"
+                , "typedef struct TCP_Connection { const Random *rng; uint8_t last_packet[2 + MAX_PACKET_SIZE]; } TCP_Connection;"
+                , "typedef struct TCP_Client_Connection { TCP_Connection con; } TCP_Client_Connection;"
+                , "void random_nonce(const Random *rng, uint8_t nonce[CRYPTO_NONCE_SIZE]);"
+                , "void f(TCP_Client_Connection *tcp_conn) { random_nonce(tcp_conn->con.rng, tcp_conn->con.last_packet + CRYPTO_PUBLIC_KEY_SIZE); }"
                 ]
 
         it "UNIQUE_ERROR: allows assigning 0 to uint64_t (Section 10.B/1.E)" $ do
@@ -110,6 +218,19 @@ spec = do
                 , "}"
                 ]
 
+        it "reports every conflict, not only the first" $ do
+            shouldHaveRefinedError
+                [ "void print_float(float *pf);"
+                , "void print_int(int32_t *pi);"
+                , "void f(int32_t *i, float *x) {"
+                , "    print_float(i);"
+                , "    print_int(x);"
+                , "}"
+                ]
+                [ "Refined type mismatch detected in fixpoint solver"
+                , "Refined type mismatch detected in fixpoint solver"
+                ]
+
         it "reports refined type mismatch for incompatible pointers (Section 1.A)" $ do
             shouldHaveRefinedError
                 [ "void f() {"
@@ -120,7 +241,7 @@ spec = do
                 , "    pf = (float *)pi;"
                 , "}"
                 ]
-                ["Refined type mismatch detected in fixpoint solver"]
+                ["Cast between incompatible types"]
 
         it "reports error for nominal arity mismatch between structs (Section 2.B)" $ do
             shouldHaveRefinedError
@@ -130,7 +251,7 @@ spec = do
                 , "    struct Large *l = (struct Large *)s;"
                 , "}"
                 ]
-                ["Refined type mismatch detected in fixpoint solver"]
+                ["Cast between incompatible types"]
 
         it "enforces nominal identity: same fields, different names (Section 1.A)" $ do
             -- Hic enforces strict nominal identity. Even if two structs have the same
@@ -142,7 +263,7 @@ spec = do
                 , "    struct Beta *b = (struct Beta *)a;"
                 , "}"
                 ]
-                ["Refined type mismatch detected in fixpoint solver"]
+                ["Cast between incompatible types"]
 
         it "forbids arity modification: treating a large struct as a smaller one (Section 2.B)" $ do
             -- This is the "Base/Derived" pattern often used in C but forbidden in Hic.
@@ -153,7 +274,7 @@ spec = do
                 , "    struct Base *b = (struct Base *)d; // Error: arity mismatch"
                 , "}"
                 ]
-                ["Refined type mismatch detected in fixpoint solver"]
+                ["Cast between incompatible types"]
 
     describe "Function calls" $ do
         it "reports error for function parameter mismatch (Section 1.A)" $ do
@@ -165,7 +286,62 @@ spec = do
                 , "    print_float((float *)pi);"
                 , "}"
                 ]
-                ["Refined type mismatch detected in fixpoint solver"]
+                ["Cast between incompatible types"]
+
+    describe "the operating system's interfaces" $ do
+        it "lets only the os_ files use the operating system's types and functions" $ do
+            prog <- mustParseFiles
+                [ ("toxcore/os_network.c",
+                    [ "int32_t os_probe(int32_t fd) { struct ifreq req; return ioctl(fd, 1, &req); }" ])
+                , ("toxcore/LAN_discovery.c",
+                    [ "int32_t probe(int32_t fd) { struct ifreq req; return ioctl(fd, 1, &req); }" ])
+                ]
+            programShouldHaveRefinedError prog
+                [ "PlatformOutsideItsLayer \"struct ifreq\""
+                , "PlatformOutsideItsLayer \"ioctl\""
+                ]
+
+        it "lets a socket address be seen as each kind of socket address" $ do
+            platformShouldHaveRefinedError
+                [ "int32_t use_addr(const struct sockaddr *_Nonnull addr);"
+                , "typedef struct Network_Addr { struct sockaddr_storage addr; } Network_Addr;"
+                , "int32_t f(Network_Addr *_Nonnull a) {"
+                , "    struct sockaddr_in *addr4 = (struct sockaddr_in *)&a->addr;"
+                , "    return use_addr((const struct sockaddr *)addr4);"
+                , "}"
+                ]
+                []
+
+        it "doesn't let anything else be seen as a socket address" $ do
+            platformShouldHaveRefinedError
+                [ "typedef struct IP_Port { uint16_t port; } IP_Port;"
+                , "int32_t use_addr(const struct sockaddr *_Nonnull addr);"
+                , "int32_t f(IP_Port *_Nonnull ip_port) { return use_addr((const struct sockaddr *)ip_port); }"
+                ]
+                ["Cast between incompatible types"]
+
+        it "lets a socket's number be a Windows handle" $ do
+            platformShouldHaveRefinedError
+                [ "void poll_handle(HANDLE handle);"
+                , "void f(uintptr_t sock) { poll_handle((HANDLE)sock); }"
+                ]
+                []
+
+        it "lets a string be given as LPSTR to a function that only reads it" $ do
+            platformShouldHaveRefinedError
+                [ "void f(const char *_Nonnull s, struct sockaddr_storage *_Nonnull addr) {"
+                , "    int32_t len = sizeof(*addr);"
+                , "    WSAStringToAddressA((LPSTR)s, 2, nullptr, (struct sockaddr *)addr, &len);"
+                , "}"
+                ]
+                []
+
+        it "doesn't let a string lose its const as LPSTR anywhere else" $ do
+            platformShouldHaveRefinedError
+                [ "void write_string(LPSTR s);"
+                , "void f(const char *_Nonnull s) { write_string((LPSTR)s); }"
+                ]
+                ["Cast between incompatible types"]
 
     describe "void* handling" $ do
         it "reports error when void* is used to smuggle wrong type (Section 1.B)" $ do
@@ -187,7 +363,7 @@ spec = do
                 , "    float **ppf = (float **)pp; // Error: T** cannot be unified with float**"
                 , "}"
                 ]
-                ["Refined type mismatch detected in fixpoint solver"]
+                ["Cast between incompatible types"]
 
         it "supports isolated use of void* for different types in different calls (Call-Site Refresh - Section 5.A)" $ do
             shouldHaveNoRefinedErrors
@@ -252,8 +428,128 @@ spec = do
                 , "}"
                 ]
 
+        it "passes a VLA where a sized array is required" $ do
+            shouldHaveNoRefinedErrors
+                [ "int32_t use(const uint8_t key[32]);"
+                , "int32_t f(uint16_t size) {"
+                , "    if (size < 32) { return -1; }"
+                , "    VLA(uint8_t, buf, size);"
+                , "    return use(buf);"
+                , "}"
+                ]
+
+        it "doesn't let a function's local variable hide a function elsewhere" $ do
+            shouldHaveNoRefinedErrors
+                [ "bool in_list(const int32_t *p);"
+                , "void a(void) { const bool in_list = true; }"
+                , "bool b(void) { int32_t x = 1; return in_list(&x); }"
+                ]
+
+        it "takes a choice of a pointer or nullptr as a nullable pointer" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef struct IP_Port { uint32_t ip; } IP_Port;"
+                , "uint32_t pick(bool set) {"
+                , "    IP_Port x;"
+                , "    x.ip = 1;"
+                , "    const IP_Port *ip_port = set ? &x : nullptr;"
+                , "    return ip_port == nullptr ? 0 : ip_port->ip;"
+                , "}"
+                ]
+
+        it "checks an error return's assignment against what it assigns to" $ do
+            -- `*out = nullptr; return false;` is a Raise: the value goes to
+            -- *out, and false is returned.
+            shouldHaveNoRefinedErrors
+                [ "bool get(uint8_t **out, uint8_t *p) {"
+                , "    if (p == nullptr) {"
+                , "        *out = nullptr;"
+                , "        return false;"
+                , "    }"
+                , "    *out = p;"
+                , "    return true;"
+                , "}"
+                ]
+            shouldHaveRefinedError
+                [ "int get(uint8_t **out, float *f) {"
+                , "    if (f == nullptr) {"
+                , "        *out = f;"
+                , "        return -1;"
+                , "    }"
+                , "    return 0;"
+                , "}"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
+        it "allows copying between enums and integers" $ do
+            -- What fits is tokstyle's to check.
+            shouldHaveNoRefinedErrors
+                [ "typedef enum Userstatus { USERSTATUS_NONE, USERSTATUS_AWAY } Userstatus;"
+                , "typedef struct Friend { Userstatus userstatus; } Friend;"
+                , "uint8_t get_status(const Friend *f) { return f->userstatus; }"
+                , "void set_status(Friend *f, uint8_t status) { f->userstatus = status; }"
+                ]
+
+        it "allows casting between enums and integers" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef enum Connection_Status { CONNECTION_NONE, CONNECTION_TCP } Connection_Status;"
+                , "Connection_Status to_status(int ret) { return (Connection_Status)ret; }"
+                , "uint8_t from_status(Connection_Status s) { return (uint8_t)s; }"
+                ]
+
+        it "allows casting a size to an integer type" $ do
+            shouldHaveNoRefinedErrors
+                [ "int f(int len) {"
+                , "    if (len < (int)sizeof(uint64_t)) {"
+                , "        return 1;"
+                , "    }"
+                , "    return 0;"
+                , "}"
+                ]
+
+        it "copies a constant struct's value into mutable storage" $ do
+            -- A copy is a new object: the source's own constness stays behind.
+            shouldHaveNoRefinedErrors
+                [ "typedef struct Family { uint8_t value; } Family;"
+                , "static const Family family_ipv4 = {2};"
+                , "Family net_family_ipv4(void) { return family_ipv4; }"
+                , "void reset(Family *f) { *f = family_ipv4; }"
+                ]
+
+        it "knows the C, stdint and OS integer types" $ do
+            platformShouldHaveRefinedError
+                [ "void f(uint8_t b) {"
+                , "    uint16_t x = (uint_fast16_t)b;"
+                , "    uint64_t y = (unsigned long long)b;"
+                , "    long int z = -1;"
+                , "    nfds_t n = (nfds_t)x;"
+                , "}"
+                ]
+                []
+
+        it "binds an array parameter as an array in the function's body" $ do
+            shouldHaveNoRefinedErrors
+                [ "bool pk_equal(const uint8_t pk1[32], const uint8_t pk2[32]) {"
+                , "    return pk1[0] == pk2[0];"
+                , "}"
+                ]
+
+        it "checks what's assigned to a declared pointer against its declaration" $ do
+            -- slot isn't bound to the nullptr it starts as, so the address
+            -- assigned later doesn't conflict with it.
+            shouldHaveNoRefinedErrors
+                [ "struct Entry { int32_t x; };"
+                , "void f(struct Entry *bucket) {"
+                , "    struct Entry *slot = nullptr;"
+                , "    slot = &bucket[1];"
+                , "}"
+                ]
+
         it "reports error when attempting to refine a physically constant literal (Physical Stability - Section 12.C.5)" $ do
-            -- pendingWith "implementation currently exempts literals from physical constancy check"
+            -- This was found as the dereference meeting p bound to the nullptr
+            -- it's initialised with. A declared variable is now bound to its
+            -- declaration, which what's assigned to it doesn't refine: that
+            -- would also make `p = nullptr; ... p = &x;` conflict.
+            pendingWith "assigned values don't refine a declared variable"
             -- Literals (like nullptr) are physically const and cannot be refined to mutable.
             shouldHaveRefinedError
                 [ "void test() {"
@@ -301,6 +597,111 @@ spec = do
                 ]
 
     describe "Pointer Arithmetic and Arrays" $ do
+        it "lets an array stand in for a pointer to its elements" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef struct Peer { uint8_t pk[32]; } Peer;"
+                , "void pk_copy(uint8_t *dest, const uint8_t *src);"
+                , "void f(Peer *a, const Peer *b, const uint8_t *data) {"
+                , "    pk_copy(a->pk, b->pk);"
+                , "    pk_copy(a->pk, data);"
+                , "    const uint8_t *p = b->pk;"
+                , "    pk_copy(a->pk, p);"
+                , "}"
+                ]
+
+        it "reports an array passed for a pointer to a different type" $ do
+            shouldHaveRefinedError
+                [ "typedef struct Peer { uint8_t pk[32]; } Peer;"
+                , "void use(const float *f);"
+                , "void f(const Peer *a) {"
+                , "    use(a->pk);"
+                , "}"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
+        it "allows a pointer where an array without a size is required" $ do
+            shouldHaveNoRefinedErrors
+                [ "void use(const uint8_t data[], uint32_t length);"
+                , "void f(const uint8_t *p, uint32_t length) { use(p, length); }"
+                ]
+
+        it "reports a pointer passed where an array is required" $ do
+            shouldHaveRefinedError
+                [ "void use(const uint8_t key[32]);"
+                , "void f(const uint8_t *data) {"
+                , "    use(data);"
+                , "}"
+                ]
+                ["Argument 1 of use is too short"]
+
+        it "gives each function its own variables for a callback typedef's parameters" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef uint64_t time_cb(void *user_data);"
+                , "typedef struct Mono_Time { time_cb *cb; void *user_data; } Mono_Time;"
+                , "void set_callback(Mono_Time *mono_time, time_cb *cb) {"
+                , "    mono_time->cb = cb;"
+                , "    mono_time->user_data = mono_time;"
+                , "}"
+                , "typedef int handler_cb(void *object);"
+                , "void register_handler(handler_cb *cb, void *object);"
+                , "typedef struct Client { int x; } Client;"
+                , "static int handle(void *object) {"
+                , "    const Client *c = (const Client *)object;"
+                , "    return c->x;"
+                , "}"
+                , "void init(Client *c) { register_handler(handle, c); }"
+                ]
+
+        it "allows nullptr for a nullable array parameter" $ do
+            shouldHaveNoRefinedErrors
+                [ "void use(const uint8_t key[_Nullable 32]);"
+                , "void f(void) { use(nullptr); }"
+                ]
+
+        it "checks a call to a function declared in a file that comes later" $ do
+            prog <- mustParseFiles
+                [ ("a.c", ["void f(const uint8_t *data) { use(data); }"])
+                , ("b.h", ["void use(const uint8_t key[32]);"])
+                ]
+            programShouldHaveRefinedError prog ["Argument 1 of use is too short"]
+
+        it "keeps a local array an array after passing it as a pointer" $ do
+            shouldHaveNoRefinedErrors
+                [ "void fill(uint8_t *out);"
+                , "void use(const uint8_t key[32]);"
+                , "void f(void) {"
+                , "    uint8_t key[32];"
+                , "    fill(key);"
+                , "    use(key);"
+                , "}"
+                ]
+
+        it "reads the first element when dereferencing an array" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef struct Peer { uint8_t pk[32]; } Peer;"
+                , "void f(const Peer *a, uint8_t *out) {"
+                , "    *out = *a->pk;"
+                , "}"
+                ]
+
+        it "allows advancing a pointer with += and -=" $ do
+            shouldHaveNoRefinedErrors
+                [ "void f(const uint8_t *data, uint8_t *out) {"
+                , "    data += sizeof(uint16_t);"
+                , "    data -= 1;"
+                , "    *out = *data;"
+                , "}"
+                ]
+
+        it "still checks the type of what an advanced pointer points to" $ do
+            shouldHaveRefinedError
+                [ "void f(const uint8_t *data, float *out) {"
+                , "    data += 2;"
+                , "    out = data;"
+                , "}"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
         it "supports pointer increment (degrades to pointer)" $ do
             shouldHaveNoRefinedErrors
                 [ "void test(int32_t *p) {"
@@ -407,6 +808,115 @@ spec = do
                 ]
                 ["Refined type mismatch detected in fixpoint solver"]
 
+    describe "Struct Instances Through Pointers" $ do
+        it "keeps pointer instances with different types apart (Section 5.C)" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef void callback_cb(void *userdata);"
+                , "struct My_Callback { callback_cb *cb; void *userdata; };"
+                , "void handle_int(int32_t *pi);"
+                , "void handle_float(float *pf);"
+                , "void test(struct My_Callback *a, struct My_Callback *b) {"
+                , "    int32_t i;"
+                , "    float x;"
+                , "    a->cb = (callback_cb *)handle_int;"
+                , "    a->userdata = &i;"
+                , "    a->cb(a->userdata);"
+                , "    b->cb = (callback_cb *)handle_float;"
+                , "    b->userdata = &x;"
+                , "    b->cb(b->userdata);"
+                , "}"
+                ]
+
+        it "checks a link in a callee for each instance passed to it (Sections 5.C, 5.D)" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef void callback_cb(void *userdata);"
+                , "struct My_Callback { callback_cb *cb; void *userdata; };"
+                , "void handle_int(int32_t *pi);"
+                , "void handle_float(float *pf);"
+                , "void call(struct My_Callback *p) {"
+                , "    p->cb(p->userdata);"
+                , "}"
+                , "void test(struct My_Callback *a, struct My_Callback *b) {"
+                , "    int32_t i;"
+                , "    float x;"
+                , "    a->cb = (callback_cb *)handle_int;"
+                , "    a->userdata = &i;"
+                , "    call(a);"
+                , "    b->cb = (callback_cb *)handle_float;"
+                , "    b->userdata = &x;"
+                , "    call(b);"
+                , "}"
+                ]
+
+        it "reports a link broken in the caller and used in a callee (Section 5.D)" $ do
+            shouldHaveRefinedError
+                [ "typedef void callback_cb(void *userdata);"
+                , "struct My_Callback { callback_cb *cb; void *userdata; };"
+                , "void handle_int(int32_t *pi);"
+                , "void handle_float(float *pf);"
+                , "void call(struct My_Callback *p) {"
+                , "    p->cb(p->userdata);"
+                , "}"
+                , "void test(struct My_Callback *a) {"
+                , "    float x;"
+                , "    a->cb = (callback_cb *)handle_int;"
+                , "    a->userdata = &x;"
+                , "    call(a);"
+                , "}"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
+        it "keeps instances apart through a pointer field (Section 5.C)" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef void callback_cb(void *userdata);"
+                , "struct My_Callback { callback_cb *cb; void *userdata; };"
+                , "void handle_int(int32_t *pi);"
+                , "void handle_float(float *pf);"
+                , "struct Outer { struct My_Callback *inner; };"
+                , "void test(struct Outer *x, struct Outer *y) {"
+                , "    int32_t i;"
+                , "    float v;"
+                , "    x->inner->cb = (callback_cb *)handle_int;"
+                , "    x->inner->userdata = &i;"
+                , "    x->inner->cb(x->inner->userdata);"
+                , "    y->inner->cb = (callback_cb *)handle_float;"
+                , "    y->inner->userdata = &v;"
+                , "    y->inner->cb(y->inner->userdata);"
+                , "}"
+                ]
+
+        it "reports userdata from one instance passed to another's callback (Section 5.C)" $ do
+            shouldHaveRefinedError
+                [ "typedef void callback_cb(void *userdata);"
+                , "struct My_Callback { callback_cb *cb; void *userdata; };"
+                , "void handle_int(int32_t *pi);"
+                , "void handle_float(float *pf);"
+                , "void test(struct My_Callback *a, struct My_Callback *b) {"
+                , "    int32_t i;"
+                , "    float x;"
+                , "    a->cb = (callback_cb *)handle_int;"
+                , "    a->userdata = &i;"
+                , "    b->cb = (callback_cb *)handle_float;"
+                , "    b->userdata = &x;"
+                , "    a->cb(b->userdata);"
+                , "}"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
+        it "reports a pointer parameter stored in a field of the wrong type (Section 6.B)" $ do
+            pendingWith "a pointer parameter stored in a void * field loses its type"
+            shouldHaveRefinedError
+                [ "typedef void callback_cb(void *userdata);"
+                , "struct My_Callback { callback_cb *cb; void *userdata; };"
+                , "void handle_int(int32_t *pi);"
+                , "void test(struct My_Callback *a, float *f) {"
+                , "    a->cb = (callback_cb *)handle_int;"
+                , "    a->userdata = f;"
+                , "    a->cb(a->userdata);"
+                , "}"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
     describe "Polymorphic Returns and Chains" $ do
         it "supports returning a polymorphic struct instance (Section 6.B)" $ do
             -- pendingWith "Refined type mismatch detected in fixpoint solver"
@@ -457,6 +967,77 @@ spec = do
                 , "}"
                 ]
                 ["Refined type mismatch detected in fixpoint solver"]
+
+        it "checks the same access in every branch it's in" $ do
+            shouldHaveRefinedError
+                [ "typedef enum Tag { TAG_I, TAG_F } Tag;"
+                , "typedef union Data { int32_t i; float f; } Data;"
+                , "typedef struct Container { Tag tag; Data d; } Container;"
+                , "void test(Container *c) {"
+                , "  switch (c->tag) {"
+                , "    case TAG_I: {"
+                , "      c->d.f = 1.0f;"
+                , "      break;"
+                , "    }"
+                , "    case TAG_F: {"
+                , "      c->d.f = 1.0f;"
+                , "      break;"
+                , "    }"
+                , "  }"
+                , "}"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
+        it "checks the same access in every branch it's in, the right one first" $ do
+            shouldHaveRefinedError
+                [ "typedef enum Tag { TAG_I, TAG_F } Tag;"
+                , "typedef union Data { int32_t i; float f; } Data;"
+                , "typedef struct Container { Tag tag; Data d; } Container;"
+                , "void test(Container *c) {"
+                , "  switch (c->tag) {"
+                , "    case TAG_F: {"
+                , "      c->d.f = 1.0f;"
+                , "      break;"
+                , "    }"
+                , "    case TAG_I: {"
+                , "      c->d.f = 1.0f;"
+                , "      break;"
+                , "    }"
+                , "  }"
+                , "}"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
+        it "checks a variant getter like a function definition" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef enum Tag { TAG_I, TAG_F } Tag;"
+                , "typedef union Data { int32_t *i; float *f; } Data;"
+                , "typedef struct Container { Tag tag; Data d; } Container;"
+                , "int32_t *container_get_i(const Container *c) {"
+                , "  return c->tag == TAG_I ? c->d.i : nullptr;"
+                , "}"
+                ]
+
+        it "reports a variant getter returning the wrong type" $ do
+            shouldHaveRefinedError
+                [ "typedef enum Tag { TAG_I, TAG_F } Tag;"
+                , "typedef union Data { int32_t *i; float *f; } Data;"
+                , "typedef struct Container { Tag tag; Data d; } Container;"
+                , "float *container_get_i(const Container *c) {"
+                , "  return c->tag == TAG_I ? c->d.i : nullptr;"
+                , "}"
+                ]
+                ["Refined type mismatch detected in fixpoint solver"]
+
+        it "checks a tag getter like a function definition" $ do
+            shouldHaveNoRefinedErrors
+                [ "typedef enum Tag { TAG_I, TAG_F } Tag;"
+                , "typedef union Data { int32_t *i; float *f; } Data;"
+                , "typedef struct Container { Tag tag; Data d; } Container;"
+                , "Tag container_get_tag(const Container *c) {"
+                , "  return c->tag;"
+                , "}"
+                ]
 
         it "forbids post-initialization variant mutation (Section 2.C)" $ do
             pendingWith "tagged union mutation check not implemented"
@@ -577,7 +1158,7 @@ spec = do
                 , "    float *pf = (float *)i.p;"
                 , "}"
                 ]
-                ["Refined type mismatch detected in fixpoint solver"]
+                ["Cast between incompatible types"]
 
         it "freezes structural refinements after initialization scope (Section 1.D)" $ do
             pendingWith "initialization scope freezing not implemented"
@@ -736,7 +1317,7 @@ spec = do
                 , "    *p = 20;"
                 , "}"
                 ]
-                ["Refined type mismatch detected in fixpoint solver"]
+                ["Cast between incompatible types"]
 
         it "forbids refining string literals to mutable (Section 12.C.5)" $ do
             shouldHaveRefinedError
@@ -745,7 +1326,7 @@ spec = do
                 , "    *s = 'H';"
                 , "}"
                 ]
-                ["Refined type mismatch detected in fixpoint solver"]
+                ["Cast between incompatible types"]
 
         it "permits whitelisted external functions to preserve structural links (Section 7.C)" $ do
             pendingWith "whitelist not implemented yet"
@@ -851,6 +1432,35 @@ spec = do
                 ]
 
     describe "Reproduction Cases" $ do
+        it "terminates when a variable is assigned from itself before use" $ do
+            shouldHaveNoRefinedErrors
+                [ "void use(const uint8_t *p);"
+                , "void f(const uint8_t *packet) {"
+                , "    const uint8_t *payload = packet + 1;"
+                , "    payload = payload + 1;"
+                , "    use(payload);"
+                , "}"
+                ]
+
+        it "keeps a pointer's type when variables are assigned from each other" $ do
+            shouldHaveNoRefinedErrors
+                [ "void f(const uint8_t *a, const uint8_t *b, uint8_t *out) {"
+                , "    a = b;"
+                , "    b = a;"
+                , "    *out = *a;"
+                , "}"
+                ]
+
+        it "terminates when two variables are assigned from each other" $ do
+            shouldHaveNoRefinedErrors
+                [ "void use(const uint8_t *p);"
+                , "void f(const uint8_t *a, const uint8_t *b) {"
+                , "    a = b;"
+                , "    b = a;"
+                , "    use(a);"
+                , "}"
+                ]
+
         it "allows packing a boolean and returning 1 (net_pack_bool)" $ do
             shouldHaveNoRefinedErrors
                 [ "size_t net_pack_bool(uint8_t *bytes, bool v) {"

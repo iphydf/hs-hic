@@ -196,6 +196,9 @@ transformComment (Fix commentNode) = Fix <$> case commentNode of
     C.DocWord l -> C.DocWord <$> transformLexeme l
     C.DocRef l -> C.DocRef <$> transformLexeme l
     C.DocP l -> C.DocP <$> transformLexeme l
+    C.DocThread l -> C.DocThread <$> transformLexeme l
+    C.DocGuardedBy l -> C.DocGuardedBy <$> transformLexeme l
+    C.DocRequires l l' -> C.DocRequires <$> transformLexeme l <*> transformLexeme l'
 
 transformNode :: C.Node (C.Lexeme Text) -> State ScopeState (C.Node (C.Lexeme ScopedId))
 transformNode (Fix node) = dtrace ("transformNode: " ++ Text.unpack (showNodePlain (Fix node))) $ Fix <$> case node of
@@ -459,6 +462,7 @@ transformNode (Fix node) = dtrace ("transformNode: " ++ Text.unpack (showNodePla
     C.TyBitwise a -> C.TyBitwise <$> transformNode a
 
     C.AttrPrintf l l' a -> C.AttrPrintf <$> transformLexeme l <*> transformLexeme l' <*> transformNode a
+    C.AttrAllocSize ls a -> C.AttrAllocSize <$> mapM transformLexeme ls <*> transformNode a
 
     C.MacroBodyFunCall a -> C.MacroBodyFunCall <$> transformNode a
 

@@ -221,8 +221,9 @@ spec = do
         it "joins deeply nested qualified pointers" $ do
             let p1 = Pointer (Nonnull (Pointer (BuiltinType S32Ty)))
             let p2 = Pointer (Nullable (Pointer (BuiltinType S32Ty)))
-            -- Join(Nonnull, Nullable) -> Nullable. 
-            join p1 p2 `shouldBe` Pointer (Nullable (Pointer (BuiltinType S32Ty)))
+            -- Join(Nonnull, Nullable) -> Nullable. They differ at a level
+            -- that isn't const, so only a const level holds both.
+            join p1 p2 `shouldBe` Pointer (Const (Nullable (Pointer (BuiltinType S32Ty))))
 
         it "is symmetric for complex joins" $ do
             let p = Pointer (BuiltinType S32Ty)
@@ -461,12 +462,38 @@ spec = do
         -- can't recover (Array(Conflict) is not ≥ Array(Function(Conflict)) at
         -- invariant level). This is inherent to invariant type constructors.
         it "absorption join/meet for Pointer(Array(Conflict)) vs Pointer(Pointer(Function(Conflict))) (repro 27)" $ do
-            pendingWith "absorption does not hold at invariant pointer depth"
             let t1 = Pointer (Array (Just TS.Conflict) [])
             let t2 = Pointer (Pointer (Function TS.Conflict []))
             let m = meet t1 t2
             let j = join t1 m
             stripLexemes j `shouldBe` stripLexemes t1
+
+        it "absorption meet/join for pointers to pointers to Conflict in a parameter (repro 28)" $ do
+            -- Joined with a pointer to a pointer to Conflict, a pointer to a
+            -- pointer to something else is below it: no level needs 'const'.
+            let t1 = Array (Just (Function TS.VarArg [Pointer (Pointer TS.Conflict)])) []
+            let t2 = Pointer (Function TS.Conflict [Pointer (Pointer (Singleton S08Ty (-23)))])
+            stripLexemes (meet t1 (join t1 t2)) `shouldBe` stripLexemes t1
+
+        -- nullptr joined with an array that can't be null is a pointer to its
+        -- elements, but with one that can be, the array: a pointer and an
+        -- array that may be null are both above both, and neither is above
+        -- the other. Found by "stepTransition is associative (Join)" with
+        -- seed 1240838315.
+        it "join is associative for nullptr and arrays of both nullabilities (repro 29)" $ do
+            let t1 = BuiltinType NullPtrTy
+            let t2 = Array Nothing []
+            let t3 = Nullable (Array Nothing [])
+            stripLexemes (join t1 (join t2 t3)) `shouldBe` stripLexemes (join (join t1 t2) t3)
+
+        -- Found by "join is monotonic" with seed 1544565702: nullptr_t has one
+        -- value, so a singleton of it is nullptr whatever number it holds.
+        it "join is monotonic for non-null nullptr and a template (repro 30)" $ do
+            let a = Nonnull (Singleton NullPtrTy (-30))
+            let b = Nonnull (BuiltinType NullPtrTy)
+            let c = Template (TIdSolver 23 Nothing) Nothing
+            subtypeOf a b `shouldBe` True
+            subtypeOf (join a c) (join b c) `shouldBe` True
 
     describe "properties" $ do
         prop "join is reflexive" $ \t ->

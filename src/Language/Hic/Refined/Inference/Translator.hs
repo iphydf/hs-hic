@@ -42,17 +42,102 @@ import qualified Language.Hic.TypeSystem.Core.Base           as TS
 
 translateRegistry :: TS.TypeSystem -> State TranslatorState (Registry Word32)
 translateRegistry ts = do
-    defs <- Map.traverseWithKey (\_ d -> translateDescr d) ts
+    modify $ \s -> s { tsOwnParams = ownParams ts }
+    -- Functions get their types from their prototypes; their descriptions in
+    -- the type system carry every template parameter of their arguments, and
+    -- aren't types anything is declared with.
+    defs <- Map.traverseWithKey (\_ d -> translateDescr d) (Map.filter (not . isFunction) ts)
     return $ Registry defs
+  where
+    isFunction = \case
+        TS.FuncDescr{} -> True
+        _              -> False
+
+-- | Which of each struct's, union's and function typedef's parameters in the
+-- type system are its own: those of its storage. The type system's list also
+-- has the parameters of every struct it points to, which aren't this one's, as
+-- each object pointed to has its own (read through the pointer as skolems of
+-- that object).
+ownParams :: TS.TypeSystem -> Map.Map Text [Bool]
+ownParams ts = Map.mapMaybe (fmap (mask Set.empty) . storage) ts
+  where
+    storage = \case
+        TS.FuncDescr _ ps ret args -> Just (ps, ret : args)
+        descr                      -> fmap (fmap (map snd)) (members descr)
+
+    members = \case
+        TS.StructDescr _ ps ms _ -> Just (ps, ms)
+        TS.UnionDescr _ ps ms _  -> Just (ps, ms)
+        _                        -> Nothing
+
+    mask visited (ps, tys) = map (`Set.member` foldMap (storageVars visited) tys) ps
+
+    -- The visited set stops at a struct already being looked at, which only
+    -- a pointer back to it can reach.
+    storageVars visited (Fix ty) = case ty of
+        TS.PointerF target | isStruct ts (unqualified target) -> Set.empty
+        TS.TemplateF (TS.FT tid _) -> Set.singleton tid
+        TS.TypeRefF _ (L _ _ tid) args
+            | name <- TS.templateIdBaseName tid
+            , Just (ps, ms) <- members =<< TS.lookupType name ts ->
+                if name `Set.member` visited then Set.empty else
+                foldMap (storageVars visited) (knownArgs (mask (Set.insert name visited) (ps, map snd ms)) args)
+        _ -> foldMap (storageVars visited) ty
+
+    unqualified = \case
+        Fix (TS.QualifiedF _ t) -> unqualified t
+        Fix (TS.SizedF t _)     -> unqualified t
+        t                       -> t
+
+-- | Whether a type is a reference to a struct or union.
+isStruct :: TS.TypeSystem -> TS.TypeInfo 'TS.Global -> Bool
+isStruct ts = \case
+    Fix (TS.TypeRefF _ (L _ _ tid) _) -> case TS.lookupType (TS.templateIdBaseName tid) ts of
+        Just TS.StructDescr{} -> True
+        Just TS.UnionDescr{}  -> True
+        _                     -> False
+    _ -> False
+
+-- | The arguments of a reference at the parameters marked own. In a group of
+-- types that refer to each other, the type system gives a reference the
+-- parameters its target had when the reference was resolved, which can be
+-- fewer than it ends up with: those arguments match no parameters, and the
+-- reference is to some instance.
+knownArgs :: [Bool] -> [a] -> [a]
+knownArgs own args
+    | length own == length args = [ arg | (True, arg) <- zip own args ]
+    | otherwise                 = []
+
+-- | What a pointer points to. A struct behind a pointer is another object,
+-- with its own parameters: field access through the pointer reads them as
+-- skolems of that object ('memberOf'), so the struct has no arguments, and is
+-- any instance.
+translatePointee :: TS.TypeInfo 'TS.Global -> State TranslatorState Word32
+translatePointee inner = do
+    ts <- gets tsTypeSystem
+    let resolved = TS.resolveRef ts inner
+        TS.FlatType {..} = TS.toFlat resolved
+    case ftStructure of
+        TS.TypeRefF _ name _ | isStruct ts (Fix ftStructure) ->
+            register $ AnyRigidNodeF (RObject (VNominal (fmap translateTemplateIdGlobal name) []) (Quals (TS.QConst `Set.member` ftQuals) False))
+        _ -> translateType inner
+
+-- | The type system's arguments of a struct, at its own parameters ('ownParams').
+ownArgs :: Text -> [a] -> State TranslatorState [a]
+ownArgs name args = do
+    masks <- gets tsOwnParams
+    return $ maybe args (`knownArgs` args) (Map.lookup name masks)
 
 translateDescr :: TS.TypeDescr 'TS.Global -> State TranslatorState (TypeDefinition Word32)
 translateDescr = \case
     TS.StructDescr name params members _ -> do
         memberDefs <- mapM translateMember members
-        return $ StructDef name (map ((, Invariant) . translateTemplateIdGlobal) params) memberDefs
+        ps <- ownArgs (C.lexemeText name) params
+        return $ StructDef name (map ((, Invariant) . translateTemplateIdGlobal) ps) memberDefs
     TS.UnionDescr name params members _ -> do
         memberDefs <- mapM translateMember members
-        return $ UnionDef name (map ((, Invariant) . translateTemplateIdGlobal) params) memberDefs
+        ps <- ownArgs (C.lexemeText name) params
+        return $ UnionDef name (map ((, Invariant) . translateTemplateIdGlobal) ps) memberDefs
     TS.EnumDescr name _ ->
         return $ EnumDef name []
     TS.IntDescr name _ ->
@@ -71,7 +156,13 @@ nodeToTypeInfo ts (Fix node) = case node of
         TS.Function (nodeToTypeInfo ts ret) (map (nodeToTypeInfo ts) params)
     C.VarDecl ty _ dims ->
         let baseTy = nodeToTypeInfo ts ty
-        in if null dims then baseTy else TS.Array (Just baseTy) (map (nodeToTypeInfo ts) dims)
+            -- An array without a size (x[]) has no dimension.
+            sizes = [ nodeToTypeInfo ts size | Fix (C.DeclSpecArray _ (Just size)) <- dims ]
+            -- The first brackets say whether it's nullable (x[_Nullable N]).
+            nullability = case dims of
+                Fix (C.DeclSpecArray n _) : _ -> TS.arrayNullability n
+                _                             -> id
+        in if null dims then baseTy else nullability (TS.Array (Just baseTy) sizes)
     C.DeclSpecArray _ mSize -> maybe TS.Unconstrained (nodeToTypeInfo ts) mSize
     C.TyConst t -> TS.Const (nodeToTypeInfo ts t)
     C.TyNonnull t -> TS.Nonnull (nodeToTypeInfo ts t)
@@ -122,7 +213,9 @@ translateType'' physical ty = do
     let ty' = TS.resolveRef (tsTypeSystem st) ty
 
     let fresh = isFreshCandidate ty'
-    -- Only cache non-void types to ensure freshness for void*
+    -- Only cache types without void or anonymous templates: each void* is
+    -- its own template. A struct's parameters belong to its definition, so
+    -- types using them are shared.
     -- Also don't cache if we are forcing physical constancy, as it might
     -- conflict with a non-physical cache entry.
     mId <- if fresh || physical then return Nothing else gets (Map.lookup ty' . tsCache)
@@ -143,7 +236,6 @@ translateType'' physical ty = do
     isFreshCandidate = foldFix (\case
         TS.BuiltinTypeF TS.VoidTy -> True
         TS.TemplateF (TS.FT tid _) -> case tid of
-            TS.TIdParam {}     -> True
             TS.TIdAnonymous {} -> True
             _                  -> False
         f -> any id f)
@@ -182,12 +274,22 @@ translateType' ty = do
                     retId <- translateReturnType ret
                     argIds <- mapM translateType args
                     return $ AnyRigidNodeF (RReference (Ptr (TargetFunction argIds retId)) nullability ownership quals)
-                TS.TypeRefF TS.FuncRef name _ -> do
+                TS.TypeRefF TS.FuncRef name refArgs -> do
                     st <- get
-                    case TS.lookupType (TS.templateIdBaseName (C.lexemeText name)) (tsTypeSystem st) of
-                        Just (TS.FuncDescr _ _ ret args) -> do
-                            retId <- translateReturnType ret
-                            argIds <- mapM translateType args
+                    let typedef = TS.templateIdBaseName (C.lexemeText name)
+                    case TS.lookupType typedef (tsTypeSystem st) of
+                        Just (TS.FuncDescr _ params ret args) -> do
+                            -- The signature's parameters are the reference's
+                            -- arguments, not the typedef's variables. A
+                            -- reference has arguments for all of them, or for
+                            -- its own ('knownArgs').
+                            let own = maybe params (\m -> [ p | (True, p) <- zip m params ]) (Map.lookup typedef (tsOwnParams st))
+                                bound | length params == length refArgs = zip params refArgs
+                                      | length own == length refArgs    = zip own refArgs
+                                      | otherwise                       = []
+                                instantiate = TS.instantiateGlobal (Map.fromList bound)
+                            retId <- translateReturnType (instantiate ret)
+                            argIds <- mapM (translateType . instantiate) args
                             return $ AnyRigidNodeF (RReference (Ptr (TargetFunction argIds retId)) nullability ownership quals)
                         _ -> do
                             innerId <- translateType inner
@@ -199,7 +301,7 @@ translateType' ty = do
                     modify (addNode varNid (AnyRigidNodeF (RObject (VVar tid Nothing) (Quals False False))))
                     return $ AnyRigidNodeF (RReference (Ptr (TargetOpaque tid)) nullability ownership quals)
                 _ -> do
-                    innerId <- translateType inner
+                    innerId <- translatePointee inner
                     return $ AnyRigidNodeF (RReference (Ptr (TargetObject innerId)) nullability ownership quals)
 
         TS.FunctionF ret args -> do
@@ -213,7 +315,7 @@ translateType' ty = do
             return $ AnyRigidNodeF (RReference (Arr innerId dimIds) nullability ownership quals)
 
         TS.TypeRefF _ name params -> do
-            paramIds <- mapM translateType params
+            paramIds <- mapM translateType =<< ownArgs (TS.templateIdBaseName (C.lexemeText name)) params
             return $ AnyRigidNodeF (RObject (VNominal (fmap translateTemplateIdGlobal name) paramIds) quals)
 
         TS.TemplateF (TS.FT tid _) -> do

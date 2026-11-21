@@ -1,6 +1,7 @@
 {-# LANGUAGE DataKinds         #-}
 {-# LANGUAGE FlexibleContexts  #-}
 {-# LANGUAGE LambdaCase        #-}
+{-# LANGUAGE MonoLocalBinds    #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms   #-}
 {-# LANGUAGE StrictData        #-}
@@ -30,9 +31,9 @@ import           Data.Bits                                  (xor)
 import           Data.Fix                                   (Fix (..), foldFix,
                                                              foldFixM, unFix)
 import qualified Data.Graph                                 as Graph
-import           Data.List                                  (foldl')
 import           Data.IntMap.Strict                         (IntMap)
 import qualified Data.IntMap.Strict                         as IntMap
+import           Data.List                                  (foldl')
 import           Data.Map.Strict                            (Map)
 import qualified Data.Map.Strict                            as Map
 import           Data.Maybe                                 (catMaybes,
@@ -95,8 +96,7 @@ import           Language.Hic.TypeSystem.Core.Base          (isLPSTR,
                                                              isNetworkingStruct,
                                                              isPointerLike,
                                                              isPointerToChar,
-                                                             isVarArg,
-                                                             unwrap)
+                                                             isVarArg, unwrap)
 import qualified Language.Hic.TypeSystem.Core.Base          as TS
 import qualified Language.Hic.TypeSystem.Core.GraphSolver   as GS
 import           Language.Hic.TypeSystem.Core.Lattice       (join)
@@ -168,28 +168,6 @@ subtypeRecursive qstate actual expected reason ml ctx = do
             res <- subtypeImpl qstate ab1 eb1 reason ml ctx
             State.modify $ \s -> s { usSeen = seen }
             return res
-
-deVoidify :: TypeInfo 'Local -> Unify (TypeInfo 'Local)
-deVoidify = foldFixM alg
-  where
-    alg (PointerF it) | TS.isVoid it = do
-        tid <- nextSolverTemplate Nothing
-        -- Hoist wrappers (Nullable, Nonnull, etc.) outside the Pointer so
-        -- that e.g. void *_Nullable becomes Nullable(Pointer(Template T))
-        -- rather than Pointer(Nullable(Template T)).  The annotation
-        -- qualifies the pointer, not the pointee.
-        return $ applyWrappers it (Pointer tid)
-    alg f = return $ Fix f
-
-    applyWrappers (BuiltinType VoidTy) x = x
-    applyWrappers (Const t) x            = Const (applyWrappers t x)
-    applyWrappers (Owner t) x            = Owner (applyWrappers t x)
-    applyWrappers (Nonnull t) x          = Nonnull (applyWrappers t x)
-    applyWrappers (Nullable t) x         = Nullable (applyWrappers t x)
-    applyWrappers (Qualified qs t) x     = Qualified qs (applyWrappers t x)
-    applyWrappers (Var l t) x            = Var l (applyWrappers t x)
-    applyWrappers (Sized t l) x          = Sized (applyWrappers t x) l
-    applyWrappers _ x                    = x
 
 -- | Bucketed seen-set operations for cycle detection.
 -- Uses a cheap structural hash to avoid full tree comparisons on every lookup.

@@ -1,9 +1,11 @@
 {-# LANGUAGE DataKinds         #-}
 {-# LANGUAGE FlexibleContexts  #-}
+{-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms   #-}
 module Language.Hic.TypeSystem.Ordered.BaseSpec (spec) where
 
+import           Data.Fix                                             (foldFix)
 import           Data.List                                            (nub)
 import           Data.Map.Strict                                      (Map)
 import qualified Data.Map.Strict                                      as Map
@@ -13,6 +15,7 @@ import qualified Language.Cimple.Program                              as Program
 import           Language.Hic.Core.Errors                             (ErrorInfo (..))
 import           Language.Hic.Core.Pretty                             (ppErrorInfo,
                                                                        renderPlain)
+import           Language.Hic.Core.TypeSystem                         (TypeInfoF (ConflictF))
 import           Language.Hic.TestUtils                               (mustParse)
 import           Language.Hic.TypeSystem.Core.Base                    (Phase (..),
                                                                        TypeInfo,
@@ -29,8 +32,9 @@ import           Language.Hic.TypeSystem.Ordered.Invariants           (runInvari
 import           Language.Hic.TypeSystem.Ordered.Nullability          (runNullabilityAnalysis)
 import           Test.Hspec
 
+-- | The ordered solver, checked for what it may not infer.
 runFullAnalysis :: Program.Program Text -> OrderedSolverResult
-runFullAnalysis prog =
+runFullAnalysis prog = withoutConflicts $
     let ts = GSA.garTypeSystem $ GSA.runGlobalStructuralAnalysis prog
         aur = runArrayUsageAnalysis ts prog
         cg = runCallGraphAnalysis prog
@@ -38,6 +42,21 @@ runFullAnalysis prog =
         ir = runInvariantAnalysis ts (cgrSccs cg) prog
         cgr = runConstraintGeneration ts aur nr prog
     in runOrderedSolver ts aur ir (cgrSccs cg) cgr
+
+-- | Nothing in the ordered solver makes a Conflict: no constraint asks for
+-- one, and it only joins a type with bottom. One in what it infers would
+-- pass every check against it unseen, so a change that makes one needs to
+-- report it where it arises.
+withoutConflicts :: OrderedSolverResult -> OrderedSolverResult
+withoutConflicts res = case [ f | (f, sig) <- Map.toList (osrInferredSigs res), hasConflict sig ] of
+    [] -> res
+    fs -> error $ "the ordered solver inferred a type with Conflict in it for " ++ show fs
+            ++ ": it must be reported where it arises"
+
+hasConflict :: TypeInfo p -> Bool
+hasConflict = foldFix $ \case
+    ConflictF -> True
+    f         -> or f
 
 errorsShouldMatch :: HasCallStack => [ErrorInfo 'Local] -> [Text] -> Expectation
 errorsShouldMatch errors expected =
@@ -58,6 +77,24 @@ shouldHaveNoErrors errors =
 
 spec :: Spec
 spec = do
+    it "finds a Conflict in what a function is inferred to be, however deep" $ do
+        hasConflict (Function (BuiltinType TS.S32Ty) [TS.Pointer (TS.Pointer TS.Conflict)]) `shouldBe` True
+        hasConflict (Function (BuiltinType TS.S32Ty) [TS.Pointer (BuiltinType TS.U08Ty)]) `shouldBe` False
+
+    it "reports a nullable array parameter passed where a non-null pointer is required" $ do
+        prog <- mustParse
+            [ "void use(const uint8_t *_Nonnull p);"
+            , "void f(const uint8_t key[_Nullable 32]) { use(key); }"
+            ]
+        osrErrors (runFullAnalysis prog) `shouldSatisfy` (not . null)
+
+    it "passes a non-null array parameter where a non-null pointer is required" $ do
+        prog <- mustParse
+            [ "void use(const uint8_t *_Nonnull p);"
+            , "void f(const uint8_t key[_Nonnull 32]) { use(key); }"
+            ]
+        shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog
+
     it "handles nullary functions with (void)" $ do
         prog <- mustParse ["void f(void); void g() { f(); }"]
         shouldHaveNoErrors $ osrErrors $ runFullAnalysis prog

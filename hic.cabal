@@ -46,15 +46,24 @@ library
     Language.Hic.Inference.Program.Types
     Language.Hic.Inference.Utils
     Language.Hic.Pretty
+    Language.Hic.Refined.BufferSize
+    Language.Hic.Refined.BufferSize.Env
+    Language.Hic.Refined.BufferSize.Escape
+    Language.Hic.Refined.BufferSize.Facts
+    Language.Hic.Refined.BufferSize.Integers
+    Language.Hic.Refined.BufferSize.Paths
     Language.Hic.Refined.Context
+    Language.Hic.Refined.Effects
     Language.Hic.Refined.Inference
     Language.Hic.Refined.Inference.Lifter
+    Language.Hic.Refined.Inference.Platform
     Language.Hic.Refined.Inference.Substitution
     Language.Hic.Refined.Inference.Translator
     Language.Hic.Refined.Inference.Types
     Language.Hic.Refined.Inference.Utils
     Language.Hic.Refined.Lattice
     Language.Hic.Refined.LatticeOp
+    Language.Hic.Refined.Nullability
     Language.Hic.Refined.PathContext
     Language.Hic.Refined.Pretty
     Language.Hic.Refined.Registry
@@ -146,12 +155,14 @@ test-suite testsuite
     Language.Hic.Inference.Passes.TaggedUnionSpec
     Language.Hic.InferenceSpec
     Language.Hic.Refined.Arbitrary
+    Language.Hic.Refined.BufferSizeSpec
     Language.Hic.Refined.ContextSpec
     Language.Hic.Refined.Inference.LifterSpec
     Language.Hic.Refined.Inference.SubstitutionSpec
     Language.Hic.Refined.Inference.TranslatorSpec
     Language.Hic.Refined.InferenceSpec
     Language.Hic.Refined.LatticeOpSpec
+    Language.Hic.Refined.NullabilitySpec
     Language.Hic.Refined.PathContextSpec
     Language.Hic.Refined.SemanticEqualitySpec
     Language.Hic.Refined.SolverSpec

@@ -34,15 +34,15 @@ import           Language.Hic.Core.TypeSystem                  (Phase (Local),
 import           Language.Hic.TypeSystem.Core.Base             (isNetworkingStruct)
 import qualified Language.Hic.TypeSystem.Core.Base             as TS
 import qualified Language.Hic.TypeSystem.Core.Canonicalization as Canonicalization
+import           Language.Hic.TypeSystem.Core.Subtype          (subtypeOfGraph)
 import           Language.Hic.TypeSystem.Core.Transition       (Polarity (..),
                                                                 RigidNodeF (..),
                                                                 ValueStructure (..))
 import           Language.Hic.TypeSystem.Core.TypeGraph        (TypeGraph,
                                                                 productConstruction)
 import qualified Language.Hic.TypeSystem.Core.TypeGraph        as TG
-import           Language.Hic.TypeSystem.Core.Subtype          (subtypeOfGraph)
 
-subtypeOf :: forall p. (Ord (TS.TemplateId p)) => TypeInfo p -> TypeInfo p -> Bool
+subtypeOf :: forall p. TypeInfo p -> TypeInfo p -> Bool
 subtypeOf t1 t2 =
     let g1 = TG.minimizeGraph (TG.fromTypeInfo t1)
         g2 = TG.minimizeGraph (TG.fromTypeInfo t2)

@@ -192,9 +192,9 @@ substitute it containers = foldFix $ \f ->
         CimpleNode (C.ArrayAccess c idx)
             | isVar it idx ->
                 case listToMaybe [ con | con <- containers, C.removeSloc (stripHic c) == C.removeSloc (stripHic con) ] of
-                    Just con | length containers == 1 ->
+                    Just _ | length containers == 1 ->
                         case extractLexeme idx of
-                            Just l  -> Fix (HicNode (IterationElement l con))
+                            Just l  -> Fix (HicNode (IterationElement l c))
                             Nothing -> error "substitute: expected VarExpr"
                     _ -> Fix (CimpleNode (C.ArrayAccess c (Fix (HicNode (IterationIndex (dummyLexeme it))))))
         CimpleNode (C.VarExpr i)

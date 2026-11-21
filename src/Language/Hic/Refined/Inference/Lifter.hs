@@ -54,7 +54,8 @@ liftImplicitPolymorphism (Registry defs) = do
                                 StructDef _ ps _ -> ps
                                 UnionDef _ ps _  -> ps
                                 _                -> []
-                        if length params < length formalParams
+                        -- A nominal without arguments is to any instance.
+                        if not (null params) && length params < length formalParams
                         then do
                             -- Missing parameters: fill with original variables from def
                             let missing = drop (length params) formalParams

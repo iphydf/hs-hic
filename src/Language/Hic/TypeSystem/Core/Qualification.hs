@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE LambdaCase    #-}
 module Language.Hic.TypeSystem.Core.Qualification
     ( QualState (..)
     , Nullability (..)
@@ -8,7 +9,9 @@ module Language.Hic.TypeSystem.Core.Qualification
     , fromQuals
     , stepQual
     , allowCovariance
+    , shield
     , joinQuals
+    , stackNullability
     , meetQuals
     , subtypeQuals
     ) where
@@ -29,6 +32,8 @@ data QualState
     | QualLevel1Const  -- ^ At level 1, and it was 'const'.
     | QualLevel1Mutable -- ^ At level 1, and it was 'mutable'.
     | QualShielded     -- ^ All intermediate levels since depth 1 were 'const'.
+    | QualShieldable   -- ^ This level isn't 'const', but all intermediate
+                       -- levels before it were: making it 'const' shields it.
     | QualUnshielded   -- ^ At least one intermediate level since depth 1 was NOT 'const'.
     deriving (Show, Eq, Ord, Generic, Bounded, Enum)
 
@@ -70,6 +75,7 @@ instance Arbitrary Ownership where
 toQuals :: Set Qualifier -> (Nullability, Ownership, Constness)
 toQuals qs =
     let n = if Set.member QNullable qs then QNullable'
+            else if Set.member QNullUnspecified qs then QUnspecified
             else if Set.member QNonnull qs then QNonnull'
             else QUnspecified
         o = if Set.member QOwner qs then QOwned' else QNonOwned'
@@ -87,10 +93,19 @@ fromQuals n o c = Set.fromList $
 -- 'isConst' refers to whether the *target* (expected) level is qualified with 'const'.
 stepQual :: QualState -> Bool -> QualState
 stepQual QualTop isConst = if isConst then QualLevel1Const else QualLevel1Mutable
-stepQual QualLevel1Const isConst = if isConst then QualShielded else QualUnshielded
-stepQual QualLevel1Mutable isConst = if isConst then QualShielded else QualUnshielded
-stepQual QualShielded isConst = if isConst then QualShielded else QualUnshielded
+stepQual QualLevel1Const isConst = if isConst then QualShielded else QualShieldable
+stepQual QualLevel1Mutable isConst = if isConst then QualShielded else QualShieldable
+stepQual QualShielded isConst = if isConst then QualShielded else QualShieldable
+stepQual QualShieldable _ = QualUnshielded
 stepQual QualUnshielded _ = QualUnshielded
+
+-- | The state of a level that isn't 'const' as if it were: what making it
+-- 'const' gives, if that shields it.
+shield :: QualState -> Maybe QualState
+shield = \case
+    QualLevel1Mutable -> Just QualLevel1Const
+    QualShieldable    -> Just QualShielded
+    _                 -> Nothing
 
 -- | Determines if covariance (actual <: expected) is allowed at the current level.
 -- If not allowed, invariance (actual == expected) is required for soundness.
@@ -99,7 +114,16 @@ allowCovariance QualTop           = True
 allowCovariance QualLevel1Const   = True
 allowCovariance QualLevel1Mutable = False
 allowCovariance QualShielded      = True
+allowCovariance QualShieldable    = False
 allowCovariance QualUnshielded    = False
+
+-- | Nullability of a type qualified twice, e.g. a template bound to a
+-- qualified type. Like the union of qualifier sets in 'wrapQualified':
+-- unspecified adds nothing, and nullable wins over nonnull.
+stackNullability :: Nullability -> Nullability -> Nullability
+stackNullability QUnspecified n = n
+stackNullability n QUnspecified = n
+stackNullability n1 n2          = max n1 n2
 
 -- | Join two sets of qualifiers.
 joinQuals :: Set Qualifier -> Set Qualifier -> Set Qualifier

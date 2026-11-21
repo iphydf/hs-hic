@@ -25,20 +25,16 @@ module Language.Hic.Core.CFG
     , buildCFG
     ) where
 
-import           Control.Monad              (foldM, join)
+import           Control.Monad              (foldM)
 import           Control.Monad.State.Strict (State, get, modify, put, runState)
-import           Data.Fix                   (Fix (Fix, unFix), foldFix)
-import           Data.Foldable              (foldl')
-import           Data.List                  (find)
+import           Data.Fix                   (Fix (Fix), foldFix)
 import           Data.Map.Strict            (Map)
 import qualified Data.Map.Strict            as Map
-import           Data.Maybe                 (fromMaybe, isJust)
-import           Data.Set                   (Set)
+import           Data.Maybe                 (fromMaybe)
 import qualified Data.Set                   as Set
 import           Data.String                (IsString (..))
 import qualified Data.Text                  as T
 import           Debug.Trace                (trace)
-import           Language.Cimple            (NodeF (..))
 import qualified Language.Cimple            as C
 import           Language.Cimple.Pretty     (showNodePlain)
 import           Language.Hic.Core.AstUtils (getLexeme)
@@ -128,6 +124,14 @@ buildCFG' _ _ = Map.empty
 
 
 
+-- | A statement for what a branch knows: that its condition held, or that
+-- it didn't.
+assumeOf :: IsString l => Bool -> C.Node (C.Lexeme l) -> C.Node (C.Lexeme l)
+assumeOf truth cond = Fix (C.ExprStmt (Fix (C.FunctionCall (Fix (C.VarExpr (C.L pos cls name))) [cond])))
+  where
+    C.L pos cls _ = fromMaybe (C.L (C.AlexPn 0 0 0) C.IdVar "cond") (getLexeme cond)
+    name = if truth then "__tokstyle_assume_true" else "__tokstyle_assume_false"
+
 getCompoundStmts :: C.Node (C.Lexeme l) -> [C.Node (C.Lexeme l)]
 getCompoundStmts (Fix (C.CompoundStmt stmts)) = stmts
 getCompoundStmts stmt                         = [stmt]
@@ -206,9 +210,8 @@ buildStmt currNodeId stmt@(Fix s') = dtrace ("buildStmt processing: " <> T.unpac
         modify $ \st -> st { bsCfg = Map.adjust (\n -> n { cfgStmts = cfgStmts n ++ [cond] }) currNodeId (bsCfg st) }
         st <- get
         let thenNodeId = bsNextNodeId st
-        let (C.L pos cls _) = fromMaybe (C.L (C.AlexPn 0 0 0) C.IdVar "cond") (getLexeme cond)
-        let assumeTrue = Fix (C.ExprStmt (Fix (C.FunctionCall (Fix (C.VarExpr (C.L pos cls "__tokstyle_assume_true"))) [cond])))
-        let assumeFalse = Fix (C.ExprStmt (Fix (C.FunctionCall (Fix (C.VarExpr (C.L pos cls "__tokstyle_assume_false"))) [cond])))
+        let assumeTrue = assumeOf True cond
+        let assumeFalse = assumeOf False cond
         case mElseB of
             Just elseB -> do
                 let elseNodeId = thenNodeId + 1
@@ -235,12 +238,16 @@ buildStmt currNodeId stmt@(Fix s') = dtrace ("buildStmt processing: " <> T.unpac
                 let finalCfg = Map.adjust (\n -> n { cfgPreds = predNodes }) mergeNodeId cfgWithElse
                 put $ st' { bsCfg = finalCfg }
                 return mergeNodeId
+            -- The false branch is a node of its own, so what comes after the
+            -- if is reached from both.
             Nothing -> do
-                let mergeNodeId = thenNodeId + 1
+                let elseNodeId = thenNodeId + 1
+                let mergeNodeId = elseNodeId + 1
                 let thenNode = CFGNode thenNodeId [currNodeId] [] [assumeTrue]
-                let mergeNode = CFGNode mergeNodeId [currNodeId] [] [assumeFalse]
-                let updatedCfg = Map.insert thenNodeId thenNode $ Map.insert mergeNodeId mergeNode (bsCfg st)
-                let cfgWithSuccs = Map.adjust (\n -> n { cfgSuccs = [thenNodeId, mergeNodeId] }) currNodeId updatedCfg
+                let elseNode = CFGNode elseNodeId [currNodeId] [mergeNodeId] [assumeFalse]
+                let mergeNode = CFGNode mergeNodeId [elseNodeId] [] []
+                let updatedCfg = Map.insert thenNodeId thenNode $ Map.insert elseNodeId elseNode $ Map.insert mergeNodeId mergeNode (bsCfg st)
+                let cfgWithSuccs = Map.adjust (\n -> n { cfgSuccs = [thenNodeId, elseNodeId] }) currNodeId updatedCfg
                 put $ st { bsCfg = cfgWithSuccs, bsNextNodeId = mergeNodeId + 1 }
                 lastThenNodeId <- buildStmts (getCompoundStmts thenB) thenNodeId
                 st' <- get
@@ -254,9 +261,8 @@ buildStmt currNodeId stmt@(Fix s') = dtrace ("buildStmt processing: " <> T.unpac
         modify $ \st -> st { bsCfg = Map.adjust (\n -> n { cfgStmts = cfgStmts n ++ [cond] }) currNodeId (bsCfg st) }
         st <- get
         let thenNodeId = bsNextNodeId st
-        let (C.L pos cls _) = fromMaybe (C.L (C.AlexPn 0 0 0) C.IdVar "cond") (getLexeme cond)
-        let assumeTrue = Fix (C.ExprStmt (Fix (C.FunctionCall (Fix (C.VarExpr (C.L pos cls "__tokstyle_assume_true"))) [cond])))
-        let assumeFalse = Fix (C.ExprStmt (Fix (C.FunctionCall (Fix (C.VarExpr (C.L pos cls "__tokstyle_assume_false"))) [cond])))
+        let assumeTrue = assumeOf True cond
+        let assumeFalse = assumeOf False cond
         let elseNodeId = thenNodeId + 1
         let mergeNodeId = elseNodeId + 1
         let thenNode = CFGNode thenNodeId [currNodeId] [] [assumeTrue]
@@ -343,20 +349,22 @@ buildStmt currNodeId stmt@(Fix s') = dtrace ("buildStmt processing: " <> T.unpac
         let condNodeId = bsNextNodeId st
         let bodyNodeId = condNodeId + 1
         let loopExitNodeId = bodyNodeId + 1
+        let afterNodeId = loopExitNodeId + 1
 
-        let (C.L pos cls _) = fromMaybe (C.L (C.AlexPn 0 0 0) C.IdVar "cond") (getLexeme cond)
-        let assumeTrue = Fix (C.ExprStmt (Fix (C.FunctionCall (Fix (C.VarExpr (C.L pos cls "__tokstyle_assume_true"))) [cond])))
-        let assumeFalse = Fix (C.ExprStmt (Fix (C.FunctionCall (Fix (C.VarExpr (C.L pos cls "__tokstyle_assume_false"))) [cond])))
+        let assumeTrue = assumeOf True cond
+        let assumeFalse = assumeOf False cond
 
+        -- A break goes past what the condition being false says.
         let condNode = CFGNode condNodeId [] [bodyNodeId, loopExitNodeId] [cond]
         let bodyNode = CFGNode bodyNodeId [condNodeId] [] [assumeTrue]
-        let loopExitNode = CFGNode loopExitNodeId [condNodeId] [] [assumeFalse]
+        let loopExitNode = CFGNode loopExitNodeId [condNodeId] [afterNodeId] [assumeFalse]
+        let afterNode = CFGNode afterNodeId [loopExitNodeId] [] []
 
-        let updatedCfg = Map.insert condNodeId condNode $ Map.insert bodyNodeId bodyNode $ Map.insert loopExitNodeId loopExitNode (bsCfg st)
+        let updatedCfg = Map.insert condNodeId condNode $ Map.insert bodyNodeId bodyNode $ Map.insert loopExitNodeId loopExitNode $ Map.insert afterNodeId afterNode (bsCfg st)
         let cfgWithSuccs = Map.adjust (\n -> n { cfgSuccs = cfgSuccs n ++ [condNodeId] }) currNodeId updatedCfg
         let cfgWithPreds = Map.adjust (\n -> n { cfgPreds = cfgPreds n ++ [currNodeId] }) condNodeId cfgWithSuccs
 
-        put $ st { bsCfg = cfgWithPreds, bsNextNodeId = loopExitNodeId + 1, bsBreaks = loopExitNodeId : bsBreaks st, bsContinues = condNodeId : bsContinues st }
+        put $ st { bsCfg = cfgWithPreds, bsNextNodeId = afterNodeId + 1, bsBreaks = afterNodeId : bsBreaks st, bsContinues = condNodeId : bsContinues st }
 
         lastBodyNodeId <- buildStmts (getCompoundStmts body) bodyNodeId
 
@@ -369,7 +377,7 @@ buildStmt currNodeId stmt@(Fix s') = dtrace ("buildStmt processing: " <> T.unpac
                        else
                          bsCfg st'
         put $ st' { bsCfg = finalCfg, bsBreaks = bsBreaks st, bsContinues = bsContinues st }
-        return loopExitNodeId
+        return afterNodeId
     C.ForStmt init' cond inc body -> do
         initNodeId <- buildStmt currNodeId init'
         st <- get
@@ -377,21 +385,26 @@ buildStmt currNodeId stmt@(Fix s') = dtrace ("buildStmt processing: " <> T.unpac
         let bodyNodeId = condNodeId + 1
         let incNodeId = bodyNodeId + 1
         let exitNodeId' = incNodeId + 1
+        let afterNodeId = exitNodeId' + 1
 
+        -- The step is reached only through the body (or a continue). A
+        -- break goes past what the condition being false says.
         let condNode = CFGNode condNodeId [] [bodyNodeId, exitNodeId'] [cond]
-        let bodyNode = CFGNode bodyNodeId [condNodeId] [incNodeId] []
-        let incNode = CFGNode incNodeId [bodyNodeId] [condNodeId] [inc]
-        let exitNode' = CFGNode exitNodeId' [condNodeId] [] []
+        let bodyNode = CFGNode bodyNodeId [condNodeId] [] [assumeOf True cond]
+        let incNode = CFGNode incNodeId [] [condNodeId] [inc]
+        let exitNode' = CFGNode exitNodeId' [condNodeId] [afterNodeId] [assumeOf False cond]
+        let afterNode = CFGNode afterNodeId [exitNodeId'] [] []
 
         let updatedCfg = Map.insert condNodeId condNode $
                          Map.insert bodyNodeId bodyNode $
                          Map.insert incNodeId incNode $
-                         Map.insert exitNodeId' exitNode' (bsCfg st)
+                         Map.insert exitNodeId' exitNode' $
+                         Map.insert afterNodeId afterNode (bsCfg st)
 
         let cfgWithSuccs = Map.adjust (\n -> n { cfgSuccs = cfgSuccs n ++ [condNodeId] }) initNodeId updatedCfg
         let cfgWithPreds = Map.adjust (\n -> n { cfgPreds = cfgPreds n ++ [initNodeId, incNodeId] }) condNodeId cfgWithSuccs
 
-        put $ st { bsCfg = cfgWithPreds, bsNextNodeId = exitNodeId' + 1, bsBreaks = exitNodeId' : bsBreaks st, bsContinues = incNodeId : bsContinues st }
+        put $ st { bsCfg = cfgWithPreds, bsNextNodeId = afterNodeId + 1, bsBreaks = afterNodeId : bsBreaks st, bsContinues = incNodeId : bsContinues st }
 
         lastBodyNodeId <- buildStmts (getCompoundStmts body) bodyNodeId
 
@@ -404,21 +417,27 @@ buildStmt currNodeId stmt@(Fix s') = dtrace ("buildStmt processing: " <> T.unpac
                          bsCfg st'
 
         put $ st' { bsCfg = finalCfg, bsBreaks = bsBreaks st, bsContinues = bsContinues st }
-        return exitNodeId'
+        return afterNodeId
     C.DoWhileStmt body cond -> do
         st <- get
         let bodyNodeId = bsNextNodeId st
         let condNodeId = bodyNodeId + 1
-        let exitNodeId' = condNodeId + 1
+        let againNodeId = condNodeId + 1
+        let exitNodeId' = againNodeId + 1
+        let afterNodeId = exitNodeId' + 1
 
-        let bodyNode = CFGNode bodyNodeId [] [condNodeId] []
-        let condNode = CFGNode condNodeId [bodyNodeId] [bodyNodeId, exitNodeId'] [cond]
-        let exitNode = CFGNode exitNodeId' [condNodeId] [] []
+        -- Going round again, the body knows the condition held. A break
+        -- goes past what the condition being false says.
+        let bodyNode = CFGNode bodyNodeId [] [] []
+        let condNode = CFGNode condNodeId [] [againNodeId, exitNodeId'] [cond]
+        let againNode = CFGNode againNodeId [condNodeId] [bodyNodeId] [assumeOf True cond]
+        let exitNode = CFGNode exitNodeId' [condNodeId] [afterNodeId] [assumeOf False cond]
+        let afterNode = CFGNode afterNodeId [exitNodeId'] [] []
 
-        let updatedCfg = Map.insert bodyNodeId bodyNode $ Map.insert condNodeId condNode $ Map.insert exitNodeId' exitNode (bsCfg st)
+        let updatedCfg = Map.insert bodyNodeId bodyNode $ Map.insert condNodeId condNode $ Map.insert againNodeId againNode $ Map.insert exitNodeId' exitNode $ Map.insert afterNodeId afterNode (bsCfg st)
         let cfgWithSuccs = Map.adjust (\n -> n { cfgSuccs = [bodyNodeId] }) currNodeId updatedCfg
-        let cfgWithPreds = Map.adjust (\n -> n { cfgPreds = cfgPreds n ++ [currNodeId, condNodeId] }) bodyNodeId cfgWithSuccs
-        put $ st { bsCfg = cfgWithPreds, bsNextNodeId = exitNodeId' + 1, bsBreaks = exitNodeId' : bsBreaks st, bsContinues = condNodeId : bsContinues st }
+        let cfgWithPreds = Map.adjust (\n -> n { cfgPreds = cfgPreds n ++ [currNodeId, againNodeId] }) bodyNodeId cfgWithSuccs
+        put $ st { bsCfg = cfgWithPreds, bsNextNodeId = afterNodeId + 1, bsBreaks = afterNodeId : bsBreaks st, bsContinues = condNodeId : bsContinues st }
 
         lastBodyNodeId <- buildStmts (getCompoundStmts body) bodyNodeId
 
@@ -431,7 +450,7 @@ buildStmt currNodeId stmt@(Fix s') = dtrace ("buildStmt processing: " <> T.unpac
                          bsCfg st'
 
         put $ st' { bsCfg = finalCfg, bsBreaks = bsBreaks st, bsContinues = bsContinues st }
-        return exitNodeId'
+        return afterNodeId
     C.SwitchStmt cond body -> do
         st <- get
         let switchExitNodeId = bsNextNodeId st
@@ -439,12 +458,17 @@ buildStmt currNodeId stmt@(Fix s') = dtrace ("buildStmt processing: " <> T.unpac
         let cfg' = Map.insert switchExitNodeId switchExitNode (bsCfg st)
         put $ st { bsCfg = cfg', bsNextNodeId = switchExitNodeId + 1, bsBreaks = switchExitNodeId : bsBreaks st }
 
-        let flattenCases stmts = concatMap (\case
-                (Fix (C.Case caseCond (Fix (C.CompoundStmt bodyStmts)))) -> [(Just caseCond, bodyStmts)]
-                (Fix (C.Case _ stmt')) -> flattenCases [stmt']
-                (Fix (C.Default (Fix (C.CompoundStmt bodyStmts)))) -> [(Nothing, bodyStmts)]
-                (Fix (C.Default stmt')) -> flattenCases [stmt']
-                _ -> []) stmts
+        -- A case's body is a block, another case it shares the body with, or
+        -- a single break or return.
+        let caseBody label = \case
+                Fix (C.CompoundStmt bodyStmts) -> [(label, bodyStmts)]
+                stmt'@(Fix C.Case{})           -> flattenCases [stmt']
+                stmt'@(Fix C.Default{})        -> flattenCases [stmt']
+                stmt'                          -> [(label, [stmt'])]
+            flattenCases = concatMap (\case
+                Fix (C.Case caseCond stmt') -> caseBody (Just caseCond) stmt'
+                Fix (C.Default stmt')       -> caseBody Nothing stmt'
+                _                           -> [])
 
         let caseBlocks = flattenCases body
 
@@ -498,6 +522,9 @@ buildStmt currNodeId stmt@(Fix s') = dtrace ("buildStmt processing: " <> T.unpac
 
         put $ st_d { bsCfg = cfg_d'''', bsBreaks = bsBreaks st, bsContinues = bsContinues st }
         return switchExitNodeId
+    -- Statements inference put together (a raise is an assignment and a
+    -- return) are each their own.
+    C.Group stmts -> buildStmts stmts currNodeId
     C.Return _ -> do
         st <- get
         let cfgWithStmt = Map.adjust (\n -> n { cfgStmts = cfgStmts n ++ [stmt] }) currNodeId (bsCfg st)

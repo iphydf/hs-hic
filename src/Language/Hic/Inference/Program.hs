@@ -4,6 +4,7 @@
 module Language.Hic.Inference.Program
     ( Program (..)
     , fromCimple
+    , fromCimpleWith
     , toCimple
     ) where
 
@@ -12,20 +13,27 @@ import qualified Data.Map.Strict                      as Map
 import           Data.Text                            (Text)
 import qualified Language.Cimple                      as C
 import qualified Language.Cimple.Program              as Program
-import           Language.Hic.Ast                     (NodeF (..))
+import           Language.Hic.Ast                     (Node, NodeF (..))
 import           Language.Hic.Inference               (lower)
-import           Language.Hic.Inference.Engine        (inferProgram)
+import           Language.Hic.Inference.Engine        (inferProgram,
+                                                       inferProgramWith)
 import           Language.Hic.Inference.Program.Types (Program (..))
+import qualified Language.Hic.TypeSystem.Core.Base    as TS
 
 -- | Converts a standard Cimple Program to a high-level Hic Program.
 -- This is where global inference happens.
 fromCimple :: Program.Program Text -> Program (C.Lexeme Text)
-fromCimple cprog =
-    let (hicAsts, diags) = inferProgram cprog
-    in Program
-        { progAsts = hicAsts
-        , progDiagnostics = diags
-        }
+fromCimple = fromResult . inferProgram
+
+-- | The same, with the program's type system already worked out.
+fromCimpleWith :: TS.TypeSystem -> Program.Program Text -> Program (C.Lexeme Text)
+fromCimpleWith typeSystem = fromResult . inferProgramWith typeSystem
+
+fromResult :: (Map FilePath [Node (C.Lexeme Text)], [Text]) -> Program (C.Lexeme Text)
+fromResult (hicAsts, diags) = Program
+    { progAsts = hicAsts
+    , progDiagnostics = diags
+    }
 
 -- | Lowers a Hic Program back to a standard Cimple Program.
 toCimple :: Program (C.Lexeme Text) -> Program.Program Text

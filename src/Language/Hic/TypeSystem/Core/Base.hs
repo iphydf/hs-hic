@@ -15,6 +15,8 @@ module Language.Hic.TypeSystem.Core.Base
     , lookupType
     , insert
     , foldArray
+    , arrayNullability
+    , declaredArray
     , vars
     , builtin
     , getTemplates
@@ -229,12 +231,41 @@ insert name ty = do
             State.modify . first $ Map.insert nameText ty
             return [TypeRef UnresolvedRef (fmap TIdName name) []]
 
+unVar :: TypeInfo p -> TypeInfo p
+unVar (Var _ ty) = ty
+unVar ty         = ty
+
+-- | The nullability written in an array declarator: @x[_Nullable N]@.
+arrayNullability :: C.Nullability -> TypeInfo p -> TypeInfo p
+arrayNullability = \case
+    C.Nullable               -> Nullable
+    C.Nonnull                -> Nonnull
+    C.NullabilityUnspecified -> id
+
+-- | The type of a variable declared with array brackets, with the
+-- nullability its first brackets say (@x[_Nullable N]@). Without one, an
+-- array is non-null ('toFlat').
+declaredArray :: [C.Node (Lexeme Text)] -> TypeInfo p -> TypeInfo p
+declaredArray dims = case dims of
+    Fix (C.DeclSpecArray n _) : _ -> arrayNullability n
+    []                            -> id
+    _ : _                         -> id
+
+-- | The type of a declarator with array dimensions. The nullability in the
+-- first brackets is the whole declarator's (@x[_Nonnull N][M]@).
 foldArray :: Lexeme Text -> [[TypeInfo 'Global]] -> TypeInfo 'Global -> TypeInfo 'Global
-foldArray name arrs baseTy = Var (fmap TIdName name) (merge baseTy (concat arrs))
+foldArray name arrs baseTy = Var (fmap TIdName name) (outer (merge baseTy dims))
   where
-    merge ty (Array Nothing dims:xs) = merge (Array (Just ty) dims) xs
-    merge ty []                      = ty
-    merge ty xs                      = error (show (ty, xs))
+    dims = concat arrs
+    outer = case dims of
+        Nullable _ : _ -> Nullable
+        Nonnull _ : _  -> Nonnull
+        _              -> id
+    merge ty (Nullable d:xs)       = merge ty (d:xs)
+    merge ty (Nonnull d:xs)        = merge ty (d:xs)
+    merge ty (Array Nothing ds:xs) = merge (Array (Just ty) ds) xs
+    merge ty []                    = ty
+    merge ty xs                    = error (show (ty, xs))
 
 
 vars :: [[TypeInfo 'Global]] -> [(Lexeme Text, TypeInfo 'Global)]
@@ -295,6 +326,9 @@ builtin (L _ _         "in_port_t")  = BuiltinType U16Ty
 builtin (L _ _       "sa_family_t")  = BuiltinType U16Ty
 builtin (L _ _             "DWORD")  = BuiltinType U32Ty
 builtin (L _ _            "LPDWORD") = Pointer (BuiltinType U32Ty)
+builtin (L _ _            "SOCKET")  = BuiltinType SizeTy
+builtin (L _ _            "HANDLE")  = Pointer (BuiltinType VoidTy)
+builtin (L _ _            "nfds_t")  = BuiltinType U64Ty
 builtin (L _ _              "WORD")  = BuiltinType U16Ty
 builtin (L _ _              "BYTE")  = BuiltinType U08Ty
 builtin (L _ _               "INT")  = BuiltinType S32Ty
@@ -310,7 +344,14 @@ builtin (L _ _            "double")  = BuiltinType F64Ty
 
 builtin (L _ _               "int")  = BuiltinType S32Ty
 builtin (L _ _              "long")  = BuiltinType S64Ty
+builtin (L _ _         "long long")  = BuiltinType S64Ty
+builtin (L _ _          "long int")  = BuiltinType S64Ty
+builtin (L _ _             "short")  = BuiltinType S16Ty
+builtin (L _ _    "unsigned short")  = BuiltinType U16Ty
 builtin (L _ _     "unsigned long")  = BuiltinType U64Ty
+builtin (L _ _ "unsigned long long") = BuiltinType U64Ty
+builtin (L _ _     "uint_fast16_t")  = BuiltinType U16Ty
+builtin (L _ _         "uintptr_t")  = BuiltinType SizeTy
 builtin (L _ _      "unsigned int")  = BuiltinType U32Ty
 builtin (L _ _          "unsigned")  = BuiltinType U32Ty
 builtin (L _ _   "long signed int")  = BuiltinType S64Ty
@@ -345,8 +386,6 @@ normalizeDescr tys =
 normalizeMems :: [(Lexeme Text, TypeInfo 'Global)] -> ([(Lexeme Text, TypeInfo 'Global)], [TemplateId 'Global])
 normalizeMems mems =
     let (tys', ts) = normalizeDescr [ Var (fmap TIdName l) ty | (l, ty) <- mems ]
-        unVar (Var _ t) = t
-        unVar t         = t
         mems' = zip (map fst mems) (map unVar tys')
     in (mems', ts)
 
@@ -366,8 +405,10 @@ collectTypes node = case node of
     LiteralExpr ConstId name     -> return [NameLit (fmap TIdName name)]
     LiteralExpr Int lit          -> return [IntLit (fmap TIdName lit)]
 
-    DeclSpecArray _ Nothing        -> return []
-    DeclSpecArray _ (Just arr)     -> return [Array Nothing arr]
+    DeclSpecArray n Nothing        -> return [arrayNullability n (Array Nothing [])]
+    -- A size is a number or a constant's name. A sum or anything else is
+    -- one dimension too, of a size not known here.
+    DeclSpecArray n (Just arr)     -> return [arrayNullability n (Array Nothing [dimension arr])]
     CallbackDecl ty name         -> return [Var (fmap TIdName name) (TypeRef FuncRef (fmap TIdName ty) [])]
     VarDecl ty name []           -> return $ map (Var (fmap TIdName name)) ty
     VarDecl ty name arrs         -> return $ map (foldArray name arrs) ty
@@ -378,8 +419,10 @@ collectTypes node = case node of
     Enumerator name _            -> return [EnumMem (fmap TIdName name)]
     EnumConsts (Just dcl) mems   -> enum dcl mems
     EnumDecl dcl mems _          -> enum dcl mems
-    Typedef [BuiltinType ty] dcl _ -> insert dcl (AliasDescr dcl [] (BuiltinType ty))
-    Typedef [ty] dcl _             -> case normalizeDescr [ty] of
+    Typedef [BuiltinType ty] dcl [] -> insert dcl (AliasDescr dcl [] (BuiltinType ty))
+    -- An array typedef (typedef uint8_t Key[32];) has its dimensions in the
+    -- declarator, as a variable does.
+    Typedef [ty] dcl arrs          -> case normalizeDescr [unVar (foldArray dcl arrs ty)] of
                                       ([ty'], ts) -> insert dcl (AliasDescr dcl ts ty')
                                       _ -> error "normalizeDescr returned empty list"
 
@@ -448,6 +491,11 @@ collectTypes node = case node of
   where
     aggregate cons dcl mems = insert dcl (cons dcl (vars mems))
     enum dcl mems = insert dcl (EnumDescr dcl (concat mems))
+    dimension = \case
+        [d@IntLit{}]  -> d
+        [d@NameLit{}] -> d
+        [d@EnumMem{}] -> d
+        _             -> Unconstrained
 
 
 type CollectState = (TypeSystem, Int)

@@ -6,8 +6,8 @@ module Language.Hic.TypeSystem.Core.Subtype
     ( subtypeOfGraph
     ) where
 
-import           Control.Monad.State
 import           Control.Monad                                 (zipWithM)
+import           Control.Monad.State
 import qualified Data.IntMap.Strict                            as IntMap
 import           Data.Maybe                                    (fromMaybe)
 import qualified Data.Set                                      as Set
@@ -33,16 +33,17 @@ import           Language.Hic.TypeSystem.Core.TypeGraph        (TypeGraph,
 -- it tracks left/right states independently; in the single-state subtype
 -- check we must be stricter.
 stepSubtype :: QualState -> Bool -> QualState
-stepSubtype QualTop True              = QualLevel1Const
-stepSubtype QualTop False             = QualLevel1Mutable
-stepSubtype QualLevel1Const _         = QualShielded
-stepSubtype QualLevel1Mutable _       = QualUnshielded
-stepSubtype QualShielded _            = QualShielded
-stepSubtype QualUnshielded _          = QualUnshielded
+stepSubtype QualTop True        = QualLevel1Const
+stepSubtype QualTop False       = QualLevel1Mutable
+stepSubtype QualLevel1Const _   = QualShielded
+stepSubtype QualLevel1Mutable _ = QualUnshielded
+stepSubtype QualShielded _      = QualShielded
+stepSubtype QualShieldable _    = QualUnshielded
+stepSubtype QualUnshielded _    = QualUnshielded
 
 -- | Evaluates if `gActual` is a valid subtype of `gExpected` under strict C
 -- rules (e.g. enforcing pointer invariance where required).
-subtypeOfGraph :: forall p. (Ord (TemplateId p)) => TypeGraph p -> TypeGraph p -> Bool
+subtypeOfGraph :: forall p. TypeGraph p -> TypeGraph p -> Bool
 subtypeOfGraph gActual gExpected =
     evalState (check QualTop gActual gExpected False (tgRoot gActual) (tgRoot gExpected)) Set.empty
   where
@@ -86,9 +87,9 @@ subtypeOfGraph gActual gExpected =
                         -- enables covariant widening comes from the child
                         -- being const, matching the transition's getTargetState.
                         let childConst nid g = case getNode nid g of
-                                RValue _ c _ -> c
+                                RValue _ c _      -> c
                                 RFunction _ _ c _ -> c
-                                _ -> QMutable'
+                                _                 -> QMutable'
                             qChild tExpChild = stepSubtype q (childConst tExpChild gE == QConst')
 
                         case (vAct, vExp) of
@@ -111,9 +112,11 @@ subtypeOfGraph gActual gExpected =
                                 if not nOk || not oOk then return False
                                 else check (qChild tExp') gA gE swapped tAct' tExp'
 
-                            (VArray mAct' dsAct', VArray mExp' dsExp') -> do
+                            (VArray mAct' dsAct' nAct' oAct', VArray mExp' dsExp' nExp' oExp') -> do
                                 let sizeOk = null dsExp' || length dsAct' == length dsExp'
-                                if not sizeOk then return False
+                                    nOk = if cov then nAct' <= nExp' else nAct' == nExp'
+                                    oOk = if cov then oAct' <= oExp' else oAct' == oExp'
+                                if not sizeOk || not nOk || not oOk then return False
                                 else do
                                     let tAct' = fromMaybe (-1) mAct'
                                         tExp' = fromMaybe (-1) mExp'
@@ -124,24 +127,20 @@ subtypeOfGraph gActual gExpected =
                                         dsOk <- zipWithM (\dA dE -> check QualTop gA gE swapped dA dE) dsAct' dsExp'
                                         return (and dsOk)
 
-                            (VArray mAct' dsAct', VPointer tExp' nExp' oExp') -> do
+                            (VArray mAct' _ nAct' oAct', VPointer tExp' nExp' oExp') -> do
                                 let tAct' = fromMaybe (-1) mAct'
-                                -- Arrays are inherently non-null in C, so at covariant
-                                -- positions they satisfy any nullability constraint.
-                                -- At invariant, use QUnspecified for consistency with
-                                -- the transition's Pointer/Array merge result.
-                                let nOk = if cov then True else QUnspecified == nExp'
-                                let oOk = if cov then QNonOwned' <= oExp' else QNonOwned' == oExp'
+                                let nOk = if cov then nAct' <= nExp' else nAct' == nExp'
+                                let oOk = if cov then oAct' <= oExp' else oAct' == oExp'
                                 if not nOk || not oOk then return False
                                 else check (qChild tExp') gA gE swapped tAct' tExp'
 
-                            (VPointer _ _ _, VArray _ _) -> return False
+                            (VPointer _ _ _, VArray _ _ _ _) -> return False
 
                             -- nullptr_t subtyping
                             (VBuiltin NullPtrTy, VPointer _ nExp' _) -> return $ nExp' /= QNonnull'
                             (VSingleton NullPtrTy _, VPointer _ nExp' _) -> return $ nExp' /= QNonnull'
-                            (VBuiltin NullPtrTy, VArray _ _) -> return True
-                            (VSingleton NullPtrTy _, VArray _ _) -> return True
+                            (VBuiltin NullPtrTy, VArray _ _ nExp' _) -> return $ nExp' /= QNonnull'
+                            (VSingleton NullPtrTy _, VArray _ _ nExp' _) -> return $ nExp' /= QNonnull'
 
                             -- Other structural matches
                             (VTemplate ftAct _ _, VTemplate ftExp _ _) -> return $ ftId ftAct == ftId ftExp

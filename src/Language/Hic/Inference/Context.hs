@@ -4,6 +4,7 @@ module Language.Hic.Inference.Context
     ( Context (..)
     , emptyContext
     , collectContext
+    , collectContextWith
     ) where
 
 import           Data.Fix                          (Fix (..))
@@ -31,9 +32,12 @@ emptyContext :: Context
 emptyContext = Context Map.empty Map.empty Map.empty Map.empty Map.empty
 
 collectContext :: Program.Program Text -> Context
-collectContext prog =
+collectContext prog = collectContextWith (TS.collect (Program.toList prog)) prog
+
+-- | The same, with the program's type system already worked out.
+collectContextWith :: TS.TypeSystem -> Program.Program Text -> Context
+collectContextWith typeSystem prog =
     let tus = Program.toList prog
-        typeSystem = TS.collect tus
         ctx = foldl (flip collectFile) (emptyContext { ctxTypeSystem = typeSystem }) tus
     in ctx
   where

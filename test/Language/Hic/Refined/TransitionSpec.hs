@@ -27,7 +27,8 @@ import           Language.Hic.Refined.State
 import           Language.Hic.Refined.Transition       (TransitionEnv (..),
                                                         isBot, isNonnull,
                                                         isRefinable, isTop,
-                                                        step, variableKey)
+                                                        step, transitionEnv,
+                                                        variableKey)
 import           Language.Hic.Refined.Types
 import           Test.Hspec
 import           Test.Hspec.QuickCheck                 (prop)
@@ -45,6 +46,7 @@ spec = do
         i32PtrID = 6
         voidPtrID = 7
         voidPtrSkolemID = 17
+        voidSkolem = TIdSkolem 752 752 2802
         voidPtrConstID = 18
         i32ArrID = 8
         funcID = 9
@@ -93,7 +95,7 @@ spec = do
             , (i32Lit0ID, AnyRigidNodeF (RObject (VSingleton S32Ty 0) (Quals True True)))
             , (i32PtrID, AnyRigidNodeF (RReference (Ptr (TargetObject i32ID)) QUnspecified QNonOwned' (Quals False False)))
             , (voidPtrID, AnyRigidNodeF (RReference (Ptr (TargetOpaque (TIdName "T"))) QUnspecified QNonOwned' (Quals False False)))
-            , (voidPtrSkolemID, AnyRigidNodeF (RReference (Ptr (TargetOpaque (TIdSkolem 752 752 2802))) QUnspecified QNonOwned' (Quals False False)))
+            , (voidPtrSkolemID, AnyRigidNodeF (RReference (Ptr (TargetOpaque voidSkolem)) QUnspecified QNonOwned' (Quals False False)))
             , (voidPtrConstID, AnyRigidNodeF (RReference (Ptr (TargetOpaque (TIdName "T"))) QUnspecified QNonOwned' (Quals True False)))
             , (i32ArrID, AnyRigidNodeF (RReference (Arr i32ID []) QUnspecified QNonOwned' (Quals False False)))
             , (funcID, AnyRigidNodeF (RFunction [i32ID] RetVoid))
@@ -138,7 +140,7 @@ spec = do
             ]
         pathCtx = PathContext Map.empty Map.empty
 
-        env pol = TransitionEnv nodes registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+        env pol = transitionEnv nodes registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
         getRes (r, _, _) = r
         isTop' n r d i = fst $ runWriter $ isTop n r d i
         isNonnull' n r d i = fst $ runWriter $ isNonnull n r d i
@@ -193,13 +195,18 @@ spec = do
                 getRes (step (env PJoin) ps emptyRefinements) `shouldBe` fmap (\i -> ps { psNodeL = i, psNodeR = i }) (nodes Map.! voidPtrID)
 
             it "void* const join void* skolem = void* const" $ do
+                -- The skolem's target is bound to T's: the object, not the pointer.
                 let ps = ProductState voidPtrConstID voidPtrSkolemID PJoin False emptyContext 0 0 Nothing Nothing Nothing
-                getRes (step (env PJoin) ps emptyRefinements) `shouldBe` fmap (const (ps { psNodeL = voidPtrConstID, psNodeR = voidPtrSkolemID })) (nodes Map.! voidPtrConstID)
+                    (res, refs, _) = step (env PJoin) ps emptyRefinements
+                res `shouldBe` AnyRigidNodeF (RReference (Ptr (TargetObject (ps { psNodeL = varID, psNodeR = varID }))) QUnspecified QNonOwned' (Quals True False))
+                getRefinement (variableKey nodes 0 voidSkolem) refs `shouldBe` Just varID
 
             it "i32* join void* = void* (refined)" $ do
+                -- The target T is met as its object, and bound to i32.
                 let ps = ProductState i32PtrID voidPtrID PJoin False emptyContext 0 0 Nothing Nothing Nothing
-                getRes (step (env PJoin) ps emptyRefinements) `shouldBe`
-                    AnyRigidNodeF (RReference (Ptr (TargetObject (ps { psNodeL = i32ID, psNodeR = i32ID }))) QUnspecified QNonOwned' (Quals False False))
+                    (res, refs, _) = step (env PJoin) ps emptyRefinements
+                res `shouldBe` AnyRigidNodeF (RReference (Ptr (TargetObject (ps { psNodeL = i32ID, psNodeR = varID }))) QUnspecified QNonOwned' (Quals False False))
+                getRefinement (variableKey nodes 0 (TIdName "T")) refs `shouldBe` Just i32ID
 
             it "i32[] join i32[] = i32[]" $ do
                 let ps = ProductState i32ArrID i32ArrID PJoin False emptyContext 0 0 Nothing Nothing Nothing
@@ -663,7 +670,7 @@ spec = do
                     , (sizeB_ID', AnyRigidNodeF (RObject (VSizeExpr [(propChar_B, 1), (propI32_B, 1)]) (Quals True True)))
                     ]
 
-                env'' = TransitionEnv (Map.union nodes'' nodes') registry PJoin pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env'' = transitionEnv (Map.union nodes'' nodes') registry PJoin pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps'' = ProductState sizeA_ID' sizeB_ID' PJoin False emptyContext 0 0 Nothing Nothing Nothing
 
             -- Physical sort A: [(210, i32), (211, char)]
@@ -697,7 +704,7 @@ spec = do
                 isPhys _ = False
             in not (isPhys nodeX) ==>
                 let nodes' = Map.fromList [(2, nodeX)]
-                    env' = TransitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                    env' = transitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                     ps = ProductState 2 2 pol False emptyContext 0 0 Nothing Nothing Nothing
                     (res, _, _) = step env' ps emptyRefinements
                 in semEqStep res psNodeL nodeX
@@ -724,7 +731,7 @@ spec = do
                                (isPhysical nodeL && isSymbolic nodeR))
             in not isMixedMeet ==>
                 let nodes' = Map.fromList [(2, nodeL), (3, nodeR)]
-                    env' = TransitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                    env' = transitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                     swapStepResult (AnyRigidNodeF n) = AnyRigidNodeF (fmap swapPS n)
                     swapPS ps = ps { psNodeL = psNodeR ps, psNodeR = psNodeL ps, psDepthL = psDepthR ps, psDepthR = psDepthL ps }
                     psL = ProductState 2 3 pol False emptyContext 0 0 Nothing Nothing Nothing
@@ -735,7 +742,7 @@ spec = do
 
         prop "Identity for PJoin: step(PJoin, X, Bottom) == X" $ \nodeX ->
             let nodes' = Map.fromList [(botID, AnyRigidNodeF (RTerminal SBottom)), (anyID, AnyRigidNodeF (RTerminal SAny)), (conflictID, AnyRigidNodeF (RTerminal SConflict)), (3, nodeX)]
-                env' = TransitionEnv nodes' registry PJoin pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env' = transitionEnv nodes' registry PJoin pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps = ProductState 3 botID PJoin False emptyContext 0 0 Nothing Nothing Nothing
                 res = getRes (step env' ps emptyRefinements)
                 -- Map nodeX to use identical product states for identity comparison
@@ -746,7 +753,7 @@ spec = do
 
         prop "Zero for PJoin: step(PJoin, X, Any) == Any or Conflict" $ \nodeX ->
             let nodes' = Map.fromList [(botID, AnyRigidNodeF (RTerminal SBottom)), (anyID, AnyRigidNodeF (RTerminal SAny)), (conflictID, AnyRigidNodeF (RTerminal SConflict)), (3, nodeX)]
-                env' = TransitionEnv nodes' registry PJoin pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env' = transitionEnv nodes' registry PJoin pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps = ProductState 3 anyID PJoin False emptyContext 0 0 Nothing Nothing Nothing
                 res = getRes (step env' ps emptyRefinements)
             in if isTop' nodes' emptyRefinements 0 3
@@ -755,7 +762,7 @@ spec = do
 
         prop "Identity for PMeet: step(PMeet, X, Any) == X" $ \nodeX ->
             let nodes' = Map.fromList [(botID, AnyRigidNodeF (RTerminal SBottom)), (anyID, AnyRigidNodeF (RTerminal SAny)), (conflictID, AnyRigidNodeF (RTerminal SConflict)), (3, nodeX)]
-                env' = TransitionEnv nodes' registry PMeet pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env' = transitionEnv nodes' registry PMeet pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps = ProductState 3 anyID PMeet False emptyContext 0 0 Nothing Nothing Nothing
                 res = getRes (step env' ps emptyRefinements)
                 expectedResult = fmap (\i -> ProductState i i PMeet False emptyContext 0 0 Nothing Nothing Nothing) nodeX
@@ -765,19 +772,19 @@ spec = do
 
         prop "Poisoning for PJoin: step(PJoin, X, Conflict) == Conflict" $ \nodeX ->
             let nodes' = Map.fromList [(conflictID, AnyRigidNodeF (RTerminal SConflict)), (3, nodeX)]
-                env' = TransitionEnv nodes' registry PJoin pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env' = transitionEnv nodes' registry PJoin pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps = ProductState 3 conflictID PJoin False emptyContext 0 0 Nothing Nothing Nothing
             in getRes (step env' ps emptyRefinements) == AnyRigidNodeF (RTerminal SConflict)
 
         prop "Poisoning for PMeet: step(PMeet, X, Conflict) == Conflict" $ \nodeX ->
             let nodes' = Map.fromList [(conflictID, AnyRigidNodeF (RTerminal SConflict)), (3, nodeX)]
-                env' = TransitionEnv nodes' registry PMeet pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env' = transitionEnv nodes' registry PMeet pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps = ProductState 3 conflictID PMeet False emptyContext 0 0 Nothing Nothing Nothing
             in getRes (step env' ps emptyRefinements) == AnyRigidNodeF (RTerminal SConflict)
 
         prop "Zero for PMeet: step(PMeet, X, Bottom) == Bottom or Conflict (Safety Algebra)" $ \nodeX ->
             let nodes' = Map.fromList [(botID, AnyRigidNodeF (RTerminal SBottom)), (anyID, AnyRigidNodeF (RTerminal SAny)), (conflictID, AnyRigidNodeF (RTerminal SConflict)), (3, nodeX)]
-                env' = TransitionEnv nodes' registry PMeet pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env' = transitionEnv nodes' registry PMeet pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps = ProductState 3 botID PMeet False emptyContext 0 0 Nothing Nothing Nothing
                 res = getRes (step env' ps emptyRefinements)
                 expected = if isTop' nodes' emptyRefinements 0 3 || isNonnull' nodes' emptyRefinements 0 3 then AnyRigidNodeF (RTerminal SConflict) else AnyRigidNodeF (RTerminal SBottom)
@@ -786,7 +793,7 @@ spec = do
         prop "NullPtr Collapse: Reference(NullPtrTy) collapses to SBottom" $ \pol ->
             let node = AnyRigidNodeF (RReference (Ptr (TargetObject nullPtrTyID)) QUnspecified QNonOwned' (Quals False False))
                 nodes' = Map.fromList [(2, node), (nullPtrTyID, nodes Map.! nullPtrTyID)]
-                env' = TransitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env' = transitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps = ProductState 2 2 pol False emptyContext 0 0 Nothing Nothing Nothing
             in getRes (step env' ps emptyRefinements) == AnyRigidNodeF (RTerminal SBottom)
 
@@ -794,14 +801,14 @@ spec = do
             let nodeA = AnyRigidNodeF (RObject (VNominal (dummyL' (TIdName "Point")) []) (Quals False False))
                 nodeB = AnyRigidNodeF (RObject (VNominal (dummyL' (TIdName "Callback")) []) (Quals False False))
                 nodes' = Map.fromList [(2, nodeA), (3, nodeB)]
-                env' = TransitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env' = transitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps = ProductState 2 3 pol False emptyContext 0 0 Nothing Nothing Nothing
             in getRes (step env' ps emptyRefinements) == AnyRigidNodeF (RTerminal SConflict)
 
         prop "Polarity Inversion: Function arguments flip polarity" $ \pol ->
             let nodeF = AnyRigidNodeF (RFunction [i32ID] RetVoid)
                 nodes' = Map.fromList [(1000, nodeF), (i32ID, nodes Map.! i32ID)]
-                env' = TransitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env' = transitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps = ProductState 1000 1000 pol False emptyContext 0 0 Nothing Nothing Nothing
                 (res, _, _) = step env' ps emptyRefinements
             in case res of
@@ -813,7 +820,7 @@ spec = do
             let nodeM = AnyRigidNodeF (RObject (VBuiltin S32Ty) (Quals False False))
                 nodeC = AnyRigidNodeF (RObject (VBuiltin S32Ty) (Quals True False))
                 nodes' = Map.fromList [(2, nodeM), (3, nodeC)]
-                env' = TransitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
+                env' = transitionEnv nodes' registry pol pathCtx emptyPath (botID, anyID, conflictID, botID) True True
                 ps = ProductState 2 3 pol False emptyContext 0 0 Nothing Nothing Nothing
                 (res, _, _) = step env' ps emptyRefinements
             in case res of

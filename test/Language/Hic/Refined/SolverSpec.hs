@@ -22,11 +22,15 @@ import           Language.Hic.Refined.Registry    (Registry (..),
                                                    TypeDefinition (..))
 import           Language.Hic.Refined.Solver      (Constraint (..), solve)
 import           Language.Hic.Refined.State       (ProductState (..))
-import           Language.Hic.Refined.Transition  (variableKey)
+import           Language.Hic.Refined.Transition  (betterBinding, variableKey)
 import           Language.Hic.Refined.Types       (AnyRigidNodeF (..),
                                                    LatticePhase (..),
+                                                   Nullability (..),
                                                    ObjectStructure (..),
-                                                   Quals (..), RigidNodeF (..),
+                                                   Ownership (..),
+                                                   PtrTarget (..), Quals (..),
+                                                   RefStructure (..),
+                                                   RigidNodeF (..),
                                                    StdType (..),
                                                    TemplateId (..),
                                                    TerminalNode (..))
@@ -81,6 +85,12 @@ spec = do
             case solve emptyReg nodes constraints terminals of
                 Right refs -> IntMap.null (mrRefinements refs) `shouldBe` False
                 Left _     -> expectationFailure "Solver should have succeeded"
+
+        it "takes a nominal without arguments as any instance of it" $ do
+            -- A struct behind a pointer (Box) meets an instance (Box<int32>).
+            let box args = AnyRigidNodeF (RObject (VNominal (dummyL (TIdName "Box")) args) (Quals False False))
+                nodes = Map.union baseNodes (Map.fromList [(5, box []), (6, box [3])])
+            solve emptyReg nodes [CSubtype 5 6 PMeet emptyContext emptyPathCtx 0 0 Nothing ""] terminals `shouldSatisfy` isRight
 
         it "detects refinement conflict through a shared variable" $ do
             -- T <: int32 and T <: float32  => Conflict
@@ -196,7 +206,7 @@ spec = do
                 (Left _, Left _)           -> property True
                 _                          -> property False
 
-        prop "monotonicity: adding constraints only increases refinements" $ \(tg :: TypeGraph) (c1 :: Constraint) (c2 :: Constraint) ->
+        prop "monotonicity: adding constraints only makes bindings better" $ \(tg :: TypeGraph) (c1 :: Constraint) (c2 :: Constraint) ->
             let maxId = fromIntegral (Map.size (tgNodes tg))
                 fixC (CSubtype l r p ctx path dL dR loc f) = CSubtype (l `mod` maxId) (r `mod` maxId) p ctx path dL dR loc f
                 fixC (CInherit l r loc f) = CInherit (l `mod` maxId) (r `mod` maxId) loc f
@@ -205,7 +215,7 @@ spec = do
                 res1 = solve emptyReg (tgNodes tg) [c1'] terminals
                 res12 = solve emptyReg (tgNodes tg) [c1', c2'] terminals
             in case (res1, res12) of
-                (Right refs1, Right refs12) -> property $ all (\(k, v) -> IntMap.lookup k (mrRefinements refs12) == Just v) (IntMap.toList (mrRefinements refs1))
+                (Right refs1, Right refs12) -> property $ all (\(k, v) -> maybe False (\w -> w == v || betterBinding (tgNodes tg) w v) (IntMap.lookup k (mrRefinements refs12))) (IntMap.toList (mrRefinements refs1))
                 _                           -> property True
 
     describe "Regression: Infinite Loops" $ do
@@ -223,6 +233,57 @@ spec = do
             within 1000000 $
                 let res = solve emptyReg nodes constraints terminals
                 in res `shouldSatisfy` isRight
+
+    describe "Order Independence" $ do
+        it "binds a variable to the better of what it meets, whichever it meets first" $ do
+            -- Nodes 5 and 6 are the same variable T; 3 and 7 are both int32.
+            -- The solver meets (5, 7) first and binds T to 7, then (6, 3).
+            let tid = TIdParam PLocal 9 Nothing
+                var = AnyRigidNodeF (RObject (VVar tid Nothing) (Quals False False))
+                nodes = Map.union baseNodes (Map.fromList [(5, var), (6, var), (7, AnyRigidNodeF (RObject (VBuiltin S32Ty) (Quals False False)))])
+                constraints = [ CSubtype 5 7 PMeet emptyContext emptyPathCtx 0 0 Nothing "", CSubtype 6 3 PMeet emptyContext emptyPathCtx 0 0 Nothing "" ]
+            case solve emptyReg nodes constraints terminals of
+                Right refs -> getRefinement (variableKey nodes 0 tid) refs `shouldBe` Just 3
+                Left ps    -> expectationFailure $ "Expected no conflict, got " ++ show ps
+
+        it "keeps what a variable is bound to over bottom, which says nothing of it" $ do
+            let tid = TIdParam PLocal 9 Nothing
+                nodes = Map.insert 5 (AnyRigidNodeF (RObject (VVar tid Nothing) (Quals False False))) baseNodes
+                constraints = [ CSubtype 5 1 PJoin emptyContext emptyPathCtx 0 0 Nothing "", CInherit 5 0 Nothing "" ]
+            case solve emptyReg nodes constraints terminals of
+                Right refs -> getRefinement (variableKey nodes 0 tid) refs `shouldBe` Just 1
+                Left ps    -> expectationFailure $ "Expected no conflict, got " ++ show ps
+
+    describe "Pointers to Opaque Targets" $ do
+        -- Node 3 is int32, 4 is float. A @void *@ points at an opaque type
+        -- variable, which another pointer's target can bind.
+        let param i = TIdParam PLocal i Nothing
+            ptr target = AnyRigidNodeF (RReference (Ptr target) QUnspecified QNonOwned' (Quals False False))
+            var tid = AnyRigidNodeF (RObject (VVar tid Nothing) (Quals False False))
+            voidPtr i = [(i, ptr (TargetOpaque (param (i + 1)))), (i + 1, var (param (i + 1)))]
+            nodes = Map.unions
+                [ baseNodes
+                , Map.fromList (voidPtr 10 ++ voidPtr 12 ++ voidPtr 14)
+                , Map.fromList
+                    [ (9, var (TIdInstance 9))
+                    , (17, ptr (TargetObject 3))
+                    , (18, ptr (TargetObject 4))
+                    ]
+                ]
+            subtype l r = CSubtype l r PMeet emptyContext emptyPathCtx 0 0 Nothing ""
+
+        it "terminates when two of them meet a third through a variable" $ do
+            -- 9 is bound to the third first; both others then bind its target,
+            -- which must not take one and then the other, back and forth.
+            within 1000000 $
+                solve emptyReg nodes [subtype 9 14, subtype 10 9, subtype 12 9] terminals
+                    `shouldSatisfy` isRight
+
+        it "binds an opaque target to the other's target, not its pointer" $
+            solve emptyReg nodes [subtype 10 14, subtype 14 17] terminals `shouldSatisfy` isRight
+
+        it "still reports targets bound to different types" $
+            solve emptyReg nodes [subtype 10 14, subtype 10 17, subtype 14 18] terminals `shouldSatisfy` isLeft
 
     describe "Existential Promotion in Joins" $ do
         it "solves for a common existential supertype in a heterogeneous list" $ do

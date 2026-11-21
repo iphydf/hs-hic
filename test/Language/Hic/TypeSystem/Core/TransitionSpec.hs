@@ -43,10 +43,8 @@ spec = do
     let term = (TS.Unconstrained, TS.Conflict)
     let getQuals t = case fromJust (toRigid t) of
             RFunction _ _ c _ -> (Q.QUnspecified, Q.QNonOwned', c)
-            RValue (VPointer _ n o) c _ -> (n, o, c)
-            RValue (VTemplate _ n o) c _ -> (n, o, c)
-            RValue _ c _ -> (Q.QUnspecified, Q.QNonOwned', c)
-            _ -> (Q.QUnspecified, Q.QNonOwned', Q.QMutable')
+            RValue v c _      -> let (n, o) = valueQuals v in (n, o, c)
+            _                 -> (Q.QUnspecified, Q.QNonOwned', Q.QMutable')
     let getStructure t = fromJust (toRigid t)
     let lookupNode t = toRigid t
     let stepB ps a b = stepTransition ps lookupNode getQuals term (a == b) (getStructure a) (getStructure b)
@@ -188,6 +186,25 @@ spec = do
                void res1 == void res2 && getQualsFromNode res1 == getQualsFromNode res2
 
     describe "Properties Repro" $ do
+        it "takes a sized identity as the identity when joining pointer targets" $ do
+            -- Pointer(Sized Unconstrained) joined with an array of nothing and
+            -- then a pointer to Conflict gives the same as the other way round.
+            let ps = ProductState PJoin QualUnshielded QualUnshielded False
+                sizedIdentity = TS.Sized Unconstrained (C.L (C.AlexPn 0 0 0) C.IdVar (TS.TIdName "n"))
+                t1 = Pointer sizedIdentity
+                t2 = Array Nothing []
+                t3 = Pointer Conflict
+            void (stepB ps t1 (joinDeep ps t2 t3)) `shouldBe` void (stepB ps (joinDeep ps t1 t2) t3)
+
+        it "widens a mutable side joined with a const one at a level that can be shielded" $ do
+            -- A join with a const side is const, so the other side widens
+            -- too, whichever way round the joins go.
+            let ps = ProductState PJoin QualShieldable QualShieldable False
+                t1 = Singleton S32Ty 24
+                t2 = BuiltinType U32Ty
+                t3 = Singleton S16Ty 37
+            void (stepB ps t1 (joinDeep ps t2 t3)) `shouldBe` void (stepB ps (joinDeep ps t1 t2) t3)
+
         it "is symmetric (Case 1)" $ do
             let ps = ProductState PJoin QualTop QualTop False
             let t1 = Pointer (BuiltinType VoidTy)
@@ -251,12 +268,12 @@ spec = do
                 tL = Pointer TS.Unconstrained
                 tR = BuiltinType TS.S32Ty
                 -- Array vs Pointer -> sameConstructor = False in stepStructure
-                nL = RValue (VArray (Just tL) []) Q.QMutable' Nothing
+                nL = RValue (VArray (Just tL) [] Q.QNonnull' Q.QNonOwned') Q.QMutable' Nothing
                 nR = RValue (VPointer tR Q.QUnspecified Q.QNonOwned') Q.QMutable' Nothing
                 res = stepTransition ps lookupNode getQuals term False nL nR
 
             case res of
-                RValue (VArray (Just (tL_res, tR_res, _)) _) _ _ -> do
+                RValue (VArray (Just (tL_res, tR_res, _)) _ _ _) _ _ -> do
                     tL_res `shouldBe` tL
                     tR_res `shouldBe` tR
                 _ -> expectationFailure $ "Expected RArray, but got: " ++ show res
@@ -300,7 +317,7 @@ spec = do
                 let t2 = Array (Just (BuiltinType S32Ty)) []
                 let res = stepB ps t1 t2
                 case res of
-                    RValue (VArray (Just _) []) _ _ -> return ()
+                    RValue (VArray (Just _) [] _ _) _ _ -> return ()
                     _ -> expectationFailure "Expected VArray with empty elements"
 
             it "handles pointer variance (covariance allowed at top)" $ do
@@ -319,25 +336,35 @@ spec = do
                 let t2 = Array (Just Unconstrained) []
                 let res = stepB ps t1 t2
                 case res of
-                    RValue (VArray (Just (tL, tR, _)) _) _ _ -> do
+                    RValue (VArray (Just (tL, tR, _)) _ _ _) _ _ -> do
                         tL `shouldBe` Array (Just Unconstrained) []
                         tR `shouldBe` Unconstrained
                     _ -> expectationFailure "Expected VArray"
 
-            it "joins nullptr_t and Array to Array (NullPtrTy <= Array)" $ do
+            it "joins nullptr_t and a nullable Array to the Array" $ do
+                let t1 = BuiltinType NullPtrTy
+                let t2 = Nullable (Array (Just (BuiltinType S32Ty)) [])
+                let res = stepB (ProductState PJoin QualTop QualTop False) t1 t2
+                case res of
+                    RValue (VArray _ _ Q.QNullable' _) _ _ -> return ()
+                    _ -> expectationFailure $ "Expected a nullable VArray, but got: " ++ show res
+
+            it "joins nullptr_t and an Array that can't be null to an Array of unspecified nullability" $ do
+                -- An array is non-null unless it says otherwise: what holds both
+                -- is the array, if it may be null, as a pointer would be.
                 let t1 = BuiltinType NullPtrTy
                 let t2 = Array (Just (BuiltinType S32Ty)) []
                 let res = stepB (ProductState PJoin QualTop QualTop False) t1 t2
                 case res of
-                    RValue (VArray _ _) _ _ -> return ()
-                    _ -> expectationFailure $ "Expected VArray, but got: " ++ show res
+                    RValue (VArray _ _ Q.QUnspecified _) _ _ -> return ()
+                    _ -> expectationFailure $ "Expected a VArray of unspecified nullability, but got: " ++ show res
 
             it "uses QualTop for array dimensions in Join" $ do
                 let t1 = Array (Just (BuiltinType S32Ty)) [Singleton S32Ty 10]
                 let t2 = Array (Just (BuiltinType S32Ty)) [Singleton S32Ty 10]
                 let res = stepB (ProductState PJoin QualTop QualTop False) t1 t2
                 case res of
-                    RValue (VArray _ [(_, _, ps')]) _ _ -> do
+                    RValue (VArray _ [(_, _, ps')] _ _) _ _ -> do
                         psQualL ps' `shouldBe` QualTop
                         psQualR ps' `shouldBe` QualTop
                     _ -> expectationFailure "Expected VArray with dimension"
@@ -516,18 +543,27 @@ spec = do
             let (_, _, c) = getQualsFromNode res
             c `shouldBe` Q.QMutable'
 
-        it "synthesizes const for decay in invariant context" $ do
-            -- If we are in invariance mode (e.g. nested pointer), Array and Pointer should join to Pointer.
-            -- If targets are identical, no const is needed.
+        it "decays an Array to a Pointer of the same nullability in invariant context" $ do
+            -- In invariance mode (e.g. nested pointer), an Array and a
+            -- Pointer join to a Pointer if their nullability is the same; with
+            -- identical targets, no const is needed.
             let ps = ProductState PJoin Q.QualUnshielded Q.QualUnshielded False
             let t = BuiltinType S32Ty
-            let t_ptr = getStructure (Pointer t)
+            let t_ptr = getStructure (Nonnull (Pointer t))
             let t_arr = getStructure (Array (Just t) [])
             let res = stepTransition ps lookupNode getQuals term False t_ptr t_arr
             case res of
                 RValue (VPointer (_, _, ps') _ _) _ _ -> do
                     psForceConst ps' `shouldBe` False
                 _ -> expectationFailure "Expected VPointer"
+
+        it "doesn't join an Array to a Pointer that may be null in invariant context" $ do
+            -- An array can't be null, so it isn't the same as a pointer that
+            -- may be; below a level that isn't const, nothing holds both.
+            let ps = ProductState PJoin Q.QualUnshielded Q.QualUnshielded False
+            let t = BuiltinType S32Ty
+            let res = stepTransition ps lookupNode getQuals term False (getStructure (Pointer t)) (getStructure (Array (Just t) []))
+            void res `shouldBe` RSpecial SConflict
 
         it "returns bottom in Meet(int, long) in invariant context" $ do
             let ps = ProductState PMeet QualUnshielded QualUnshielded False
@@ -1155,6 +1191,61 @@ spec = do
             void res1 `shouldBe` void res2
             getQualsFromNode res1 `shouldBe` getQualsFromNode res2
 
+        -- Found by "stepTransition is associative (Join)" with seed 1853669682:
+        -- Conflict is above anything even where a level must stay the same,
+        -- so 2 targets with no type in common (here an array and a number)
+        -- join to it there too, without making the level above const.
+        it "is associative for Join (Associativity failure repro 8)" $ do
+            let q = QualShieldable
+                t1 = Array (Just (Array Nothing [])) []
+                t2 = Array (Just (BuiltinType U16Ty)) []
+                t3 = Array (Just TS.Conflict) []
+                ps = ProductState PJoin q q False
+
+                step a b = stepB ps a b
+                res1 = step t1 (joinDeep ps t2 t3)
+                res2 = step (joinDeep ps t1 t2) t3
+
+            void res1 `shouldBe` void res2
+            getQualsFromNode res1 `shouldBe` getQualsFromNode res2
+
+        -- Seed 1991192535 of "stepTransition is associative (Join)", with
+        -- numbers and pointers joined to Conflict where a level must stay the
+        -- same.
+        it "is associative for Join (Associativity failure repro 9)" $ do
+            let q = QualUnshielded
+                t1 = Pointer TS.VarArg
+                t2 = Const (Array (Just (BuiltinType U32Ty)) [])
+                t3 = Array (Just (Pointer (Singleton U08Ty 19))) []
+                ps = ProductState PJoin q q False
+
+                step a b = stepB ps a b
+                res1 = step t1 (joinDeep ps t2 t3)
+                res2 = step (joinDeep ps t1 t2) t3
+
+            void res1 `shouldBe` void res2
+            getQualsFromNode res1 `shouldBe` getQualsFromNode res2
+
+        -- Found by "stepTransition is associative (Join)" after repro 8 was
+        -- fixed, but fails without that fix too: where a level can neither
+        -- differ nor be made const, nullptr joined with a pointer to
+        -- Unconstrained is Conflict, but with a const pointer to s32 it's the
+        -- pointer.
+        it "is associative for Join (Associativity failure repro 10)" $ do
+            pendingWith "nullptr and a pointer where a level can neither differ nor be made const"
+            let q = QualUnshielded
+                t1 = Const (Pointer (BuiltinType S32Ty))
+                t2 = Pointer Unconstrained
+                t3 = Singleton NullPtrTy (-90)
+                ps = ProductState PJoin q q False
+
+                step a b = stepB ps a b
+                res1 = step t1 (joinDeep ps t2 t3)
+                res2 = step (joinDeep ps t1 t2) t3
+
+            void res1 `shouldBe` void res2
+            getQualsFromNode res1 `shouldBe` getQualsFromNode res2
+
     describe "Absorption Repro" $ do
         it "does not add const when joining with Pointer Unconstrained at top level (Covariant)" $ do
             let ps = ProductState PJoin QualTop QualTop False
@@ -1171,7 +1262,7 @@ spec = do
             let res = stepB ps t1 t2
             -- In pure lattice, invariant mismatch preserves structure.
             case res of
-                RValue (VArray (Just (tL, tR, _)) _) _ _ -> do
+                RValue (VArray (Just (tL, tR, _)) _ _ _) _ _ -> do
                     let res' = stepB (ProductState PJoin Q.QualLevel1Mutable Q.QualLevel1Mutable False) tL tR
                     case res' of
                         RValue (VPointer _ _ _) _ _ -> return ()
@@ -1193,7 +1284,7 @@ spec = do
             let t2 = Conflict
             let res = stepB ps t1 t2
             case res of
-                RValue (VArray _ _) _ _ -> return ()
+                RValue (VArray _ _ _ _) _ _ -> return ()
                 _ -> expectationFailure $ "Expected VArray, but got: " ++ show res
 
         it "collapses Array to Unconstrained in Meet with Unconstrained (Zero)" $ do
@@ -1206,9 +1297,7 @@ spec = do
 getQualsFromNode :: RigidNodeF tid a -> (Q.Nullability, Q.Ownership, Q.Constness)
 getQualsFromNode = \case
     RFunction _ _ c _ -> (Q.QUnspecified, Q.QNonOwned', c)
-    RValue (VPointer _ n o) c _ -> (n, o, c)
-    RValue (VTemplate _ n o) c _ -> (n, o, c)
-    RValue _ c _ -> (Q.QUnspecified, Q.QNonOwned', c)
+    RValue v c _ -> let (n, o) = valueQuals v in (n, o, c)
     _ -> (Q.QUnspecified, Q.QNonOwned', Q.QMutable')
 
 rnfSize' :: RigidNodeF tid a -> Maybe (C.Lexeme tid)

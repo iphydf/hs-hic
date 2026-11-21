@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveFunctor     #-}
 {-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Language.Hic.TypeSystem.Core.Transition.Types
     ( Polarity (..)
@@ -9,6 +10,7 @@ module Language.Hic.TypeSystem.Core.Transition.Types
     , RigidNodeF (..)
     , ValueStructure (..)
     , SpecialNode (..)
+    , valueQuals
     ) where
 
 import           GHC.Generics                               (Generic)
@@ -53,7 +55,8 @@ data ValueStructure tid a
     | VPointer a Nullability Ownership
     | VTemplate (FullTemplateF tid a) Nullability Ownership
     | VTypeRef TypeRef (Lexeme tid) [a]
-    | VArray (Maybe a) [a]
+    | VArray (Maybe a) [a] Nullability Ownership
+      -- ^ Non-null unless it says it's nullable (@x[_Nullable N]@).
     | VSingleton StdType Integer
     | VExternal (Lexeme tid)
     | VIntLit (Lexeme tid)
@@ -61,6 +64,15 @@ data ValueStructure tid a
     | VEnumMem (Lexeme tid)
     | VVarArg
     deriving (Show, Eq, Ord, Generic, Functor, Foldable, Traversable)
+
+-- | The nullability and ownership of a value: a pointer's, a template's or an
+-- array's. Other values have none.
+valueQuals :: ValueStructure tid a -> (Nullability, Ownership)
+valueQuals = \case
+    VPointer _ n o   -> (n, o)
+    VTemplate _ n o  -> (n, o)
+    VArray _ _ n o   -> (n, o)
+    _                -> (QUnspecified, QNonOwned')
 
 data SpecialNode = SUnconstrained | SConflict
     deriving (Show, Eq, Ord, Generic, Bounded, Enum)
@@ -87,7 +99,7 @@ instance (Arbitrary tid, Arbitrary a) => Arbitrary (ValueStructure tid a) where
         , VPointer <$> arbitrary <*> arbitrary <*> arbitrary
         , VTemplate <$> arbitrary <*> arbitrary <*> arbitrary
         , VTypeRef <$> arbitrary <*> arbitrary <*> arbitrary
-        , VArray <$> arbitrary <*> arbitrary
+        , VArray <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
         , VSingleton <$> arbitrary <*> arbitrary
         , VExternal <$> arbitrary
         , VIntLit <$> arbitrary

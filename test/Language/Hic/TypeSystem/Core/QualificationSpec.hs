@@ -18,13 +18,22 @@ spec = do
 
         it "transitions from Level1 correctly" $ do
             stepQual QualLevel1Const True `shouldBe` QualShielded
-            stepQual QualLevel1Const False `shouldBe` QualUnshielded
+            stepQual QualLevel1Const False `shouldBe` QualShieldable
             stepQual QualLevel1Mutable True `shouldBe` QualShielded
-            stepQual QualLevel1Mutable False `shouldBe` QualUnshielded
+            stepQual QualLevel1Mutable False `shouldBe` QualShieldable
 
         it "stays shielded if const" $ do
             stepQual QualShielded True `shouldBe` QualShielded
-            stepQual QualShielded False `shouldBe` QualUnshielded
+            stepQual QualShielded False `shouldBe` QualShieldable
+
+        it "leaves a level that isn't const shieldable only once" $ do
+            stepQual QualShieldable True `shouldBe` QualUnshielded
+            stepQual QualShieldable False `shouldBe` QualUnshielded
+
+        it "shields a level whose levels above are const" $ do
+            shield QualLevel1Mutable `shouldBe` Just QualLevel1Const
+            shield QualShieldable `shouldBe` Just QualShielded
+            shield QualUnshielded `shouldBe` Nothing
 
         it "stays unshielded" $ do
             stepQual QualUnshielded True `shouldBe` QualUnshielded

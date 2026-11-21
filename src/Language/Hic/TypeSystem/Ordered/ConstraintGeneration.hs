@@ -230,7 +230,7 @@ lookupVar name = do
 -- | Promote Nullable to Nonnull in qualifier wrappers, but stop at structural
 -- types (Pointer, Array, etc.) to avoid corrupting pointee qualifiers.
 promoteNonnull :: TypeInfo p -> TypeInfo p
-promoteNonnull (Qualified qs t) = Qualified (Set.insert QNonnull (Set.delete QNullable qs)) (promoteNonnull t)
+promoteNonnull (Qualified qs t) = Qualified (Set.insert QNonnull (Set.delete QNullUnspecified (Set.delete QNullable qs))) (promoteNonnull t)
 promoteNonnull (Var l t)        = Var l (promoteNonnull t)
 promoteNonnull (Sized t l)      = Sized (promoteNonnull t) l
 promoteNonnull t                = t
@@ -413,6 +413,7 @@ traverseNode = snd . foldFix alg
                 return $ BuiltinType VoidTy
 
             C.AttrPrintf _ _ (_, nAction) -> nAction >> return (BuiltinType VoidTy)
+            C.AttrAllocSize _ (_, nAction) -> nAction >> return (BuiltinType VoidTy)
 
             C.PreprocDefine l -> do
                 State.modify $ \s -> s { esMacros = Map.insert (C.lexemeText l) ([], Fix (C.LiteralExpr C.Int (L (C.AlexPn 0 0 0) C.IdVar "1"))) (esMacros s) }
@@ -461,7 +462,7 @@ registerParam = snd . foldFix alg
         _ -> sequence_ (fmap snd f))
 
 addArrays :: TypeInfo 'Local -> [Node (Lexeme Text)] -> Extract (TypeInfo 'Local)
-addArrays = foldM add
+addArrays ty0 dims = TS.declaredArray dims <$> foldM add ty0 dims
   where
     add ty (Fix node) = case node of
         C.DeclSpecArray _ (Just n) -> case unFix n of

@@ -7,24 +7,24 @@ module Language.Hic.TypeSystem.Core.SolverSpec (spec) where
 import           Test.Hspec
 import           Test.QuickCheck
 
-import           Data.Fix                             (Fix (..))
-import           Data.Map.Strict                      (Map)
-import qualified Data.Map.Strict                      as Map
-import           Data.Set                             (Set)
-import qualified Data.Set                             as Set
-import           Data.Text                            (Text)
-import qualified Data.Text                            as T
-import qualified Language.Cimple                      as C
-import           Language.Hic.Core.Errors             (MismatchReason (..))
-import           Language.Hic.TypeSystem.Core.Base    (StdType (..),
-                                                       TemplateId (..),
-                                                       TypeDescr (..),
-                                                       pattern BuiltinType,
-                                                       pattern FullTemplate,
-                                                       pattern Nonnull,
-                                                       pattern Pointer,
-                                                       pattern Template)
-import qualified Language.Hic.TypeSystem.Core.Base    as TS
+import           Data.Fix                                 (Fix (..))
+import           Data.Map.Strict                          (Map)
+import qualified Data.Map.Strict                          as Map
+import           Data.Set                                 (Set)
+import qualified Data.Set                                 as Set
+import           Data.Text                                (Text)
+import qualified Data.Text                                as T
+import qualified Language.Cimple                          as C
+import           Language.Hic.Core.Errors                 (MismatchReason (..))
+import           Language.Hic.TypeSystem.Core.Base        (StdType (..),
+                                                           TemplateId (..),
+                                                           TypeDescr (..),
+                                                           pattern BuiltinType,
+                                                           pattern FullTemplate,
+                                                           pattern Nonnull,
+                                                           pattern Pointer,
+                                                           pattern Template)
+import qualified Language.Hic.TypeSystem.Core.Base        as TS
 import           Language.Hic.TypeSystem.Core.Constraints (mapTypes)
 import           Language.Hic.TypeSystem.Core.Lattice     (subtypeOf)
 import           Language.Hic.TypeSystem.Core.Solver
@@ -314,7 +314,7 @@ spec = do
             length errs `shouldBe` 0
 
     describe "properties" $ do
-        it "is sound (results satisfy constraints unless conflict)" $ property $ \cs ->
+        it "is sound (unsatisfied constraints are reported unless conflict)" $ property $ \cs ->
                     -- Strip Lexemes to normalize template identity (random Lexeme positions
                     -- in ftIndex create spurious template identity differences).
                     -- Only verify Equality/Subtype/Lub that contain templates.
@@ -358,7 +358,11 @@ spec = do
                                 || all (\ti -> not (TS.containsTemplate ti)
                                             || subtypeOf (applyFull ti) vT) ts
                             _                     -> True
-                        failures = filter (not . check) (filter solvable cs')
+                        -- Some constraints can't hold for any bindings (e.g. a concrete
+                        -- function against an array), so the solver can't satisfy them.
+                        -- Those must be reported by the verifier, never pass silently.
+                        unreported c = null (verifyConstraints Map.empty Set.empty rawRes [c])
+                        failures = filter unreported (filter (not . check) (filter solvable cs'))
                     in counterexample ("Failures: " ++ show (map (mapTypes TS.stripLexemes) failures)
                                     ++ "\nBindings: " ++ show res)
                        (hasConflict || null failures)

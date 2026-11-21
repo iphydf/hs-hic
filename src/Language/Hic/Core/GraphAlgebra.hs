@@ -11,9 +11,11 @@ module Language.Hic.Core.GraphAlgebra
     , minimize
     , merge
     , prune
+    , canonical
     ) where
 
-import           Control.Monad.State.Strict (execState, modify)
+import           Control.Monad.State.Strict (execState, get, modify, put,
+                                             runState)
 import           Data.IntMap.Strict         (IntMap)
 import qualified Data.IntMap.Strict         as IntMap
 import           Data.IntSet                (IntSet)
@@ -107,8 +109,8 @@ minimize structuredTerminals atomicTerminals (Graph nodes root) =
 
         allNodes = nodes `IntMap.union` structuredTerminals
         newNodes = IntMap.fromList
-            [ (newIdx, fmap lookupFinal (getNode allNodes (head group)))
-            | (newIdx, group) <- zip [0..] realGroups ]
+            [ (newIdx, fmap lookupFinal (getNode allNodes first))
+            | (newIdx, first : _) <- zip [0..] realGroups ]
         newRoot = lookupFinal root
     in Graph newNodes newRoot
 
@@ -132,13 +134,34 @@ merge structuredTerminals atomicTerminals g1 g2 =
 
         allNodes = mergedNodes `IntMap.union` structuredTerminals
         newNodes = IntMap.fromList
-            [ (newIdx, fmap lookupFinal (getNode allNodes (head group)))
-            | (newIdx, group) <- zip [0..] realGroups ]
+            [ (newIdx, fmap lookupFinal (getNode allNodes first))
+            | (newIdx, first : _) <- zip [0..] realGroups ]
         newRoot1 = lookupFinal (gRoot g1)
         newRoot2 = lookupFinal (shift (gRoot g2))
     in (Graph newNodes newRoot1, newRoot1, newRoot2)
 
 -- | Standard reachability pruning.
+-- | The graph with its nodes numbered in the order a depth-first walk from
+-- the root meets them, from 0, so 2 graphs of the same shape are equal. Ids
+-- that aren't nodes (terminals) stay as they are, so they must not be
+-- numbers the nodes get.
+canonical :: forall f. (Traversable f) => Graph f -> Graph f
+canonical (Graph nodes root) =
+    let (root', (_, _, nodes')) = runState (go root) (0, IntMap.empty, IntMap.empty)
+    in Graph nodes' root'
+  where
+    go i = case IntMap.lookup i nodes of
+        Nothing -> return i
+        Just node -> do
+            (next, seen, acc) <- get
+            case IntMap.lookup i seen of
+                Just i' -> return i'
+                Nothing -> do
+                    put (next + 1, IntMap.insert i next seen, acc)
+                    node' <- traverse go node
+                    modify (\(n, s', a) -> (n, s', IntMap.insert next node' a))
+                    return next
+
 prune :: forall f. (Traversable f) => Graph f -> Graph f
 prune (Graph nodes root) =
     let reachableIds = foldl' expand (Set.singleton root) [1 .. IntMap.size nodes]
@@ -191,25 +214,15 @@ lookupClass terminals classMap i
     | IntSet.member i terminals = i
     | otherwise = IntMap.findWithDefault i i classMap
 
-buildClassMap :: IntSet -> [[NodeId]] -> IntMap Int
-buildClassMap terminals groups = IntMap.fromList
-    [ (i, classId)
-    | group <- groups
-    , let classId = case filter (`IntSet.member` terminals) group of
-            (t:_) -> t
-            []    -> head group
-    , i <- group
-    ]
-
 -- | Build both classMap and groupsByClass in a single pass from groups.
 buildClassMapAndGroups :: IntSet -> [[NodeId]] -> (IntMap Int, Map Int [NodeId])
 buildClassMapAndGroups terminals groups =
     let classMap = IntMap.fromList
             [ (i, classId)
-            | group <- groups
+            | group@(first : _) <- groups
             , let classId = case filter (`IntSet.member` terminals) group of
                     (t:_) -> t
-                    []    -> head group
+                    []    -> first
             , i <- group
             ]
         groupsByClass = Map.fromListWith (++) [ (c, [i]) | (i, c) <- IntMap.toList classMap ]
@@ -226,9 +239,7 @@ buildRemapping terminals _classMap groupsByClass =
         finalMap = IntMap.fromList $
             [ (i, newIdx) | (newIdx, group) <- zip [0..] realGroups, i <- group ] ++
             [ (i, t) | group <- Map.elems groupsByClass
-                      , let ts = filter (`IntSet.member` terminals) group
-                      , not (null ts)
-                      , let t = head ts
+                      , t : _ <- [filter (`IntSet.member` terminals) group]
                       , i <- group
                       , not (IntSet.member i terminals) ]
         lookupFinal i

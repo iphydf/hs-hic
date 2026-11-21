@@ -38,6 +38,21 @@ shouldHaveNoErrors errors =
 spec :: Spec
 spec = do
     describe "Basic type checking" $ do
+        it "reports a nullable array parameter passed where a non-null pointer is required" $ do
+            prog <- mustParse
+                [ "void use(const uint8_t *_Nonnull p);"
+                , "void f(const uint8_t key[_Nullable 32]) { use(key); }"
+                ]
+            TC.typeCheckProgram prog `shouldSatisfy` (not . null)
+
+        it "passes a non-null array parameter where a non-null pointer is required" $ do
+            pendingWith "Standard checks the argument as the array's element type"
+            prog <- mustParse
+                [ "void use(const uint8_t *_Nonnull p);"
+                , "void f(const uint8_t key[_Nonnull 32]) { use(key); }"
+                ]
+            shouldHaveNoErrors $ TC.typeCheckProgram prog
+
         it "infers types of simple literals" $ do
             prog <- mustParse ["void f() { int x = 1; }"]
             shouldHaveNoErrors $ TC.typeCheckProgram prog

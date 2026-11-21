@@ -12,6 +12,8 @@ module Language.Hic.Refined.Context
     , setRefinement
     , deleteRefinement
     , getRefinement
+    , changedKeys
+    , clearChanged
     , unsafeGetTag
     , unsafeGetId
     ) where
@@ -21,6 +23,8 @@ import           Data.Bits          (shiftL, shiftR, xor, (.&.), (.|.))
 import           Data.Hashable      (Hashable (..))
 import           Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
+import           Data.IntSet        (IntSet)
+import qualified Data.IntSet        as IntSet
 import           Data.Word          (Word16, Word32, Word64)
 import           GHC.Generics       (Generic)
 
@@ -41,22 +45,25 @@ instance ToJSON MappingContext
 data MappingRefinements = MappingRefinements
     { mrRefinements :: IntMap Word32
     , mrHash        :: {-# UNPACK #-} Word64
+    , mrChanged     :: IntSet
+    -- ^ Keys changed since the last 'clearChanged', so the solver can find
+    -- what a step changed without comparing whole maps.
     }
     deriving (Show, Generic)
 
 instance ToJSON MappingRefinements
 
 instance Eq MappingRefinements where
-    (MappingRefinements _ h1) == (MappingRefinements _ h2) = h1 == h2
+    a == b = mrHash a == mrHash b
 
 instance Ord MappingRefinements where
-    compare (MappingRefinements _ h1) (MappingRefinements _ h2) = compare h1 h2
+    compare a b = compare (mrHash a) (mrHash b)
 
 emptyContext :: MappingContext
 emptyContext = MappingContext 0 0
 
 emptyRefinements :: MappingRefinements
-emptyRefinements = MappingRefinements IntMap.empty 0
+emptyRefinements = MappingRefinements IntMap.empty 0 IntSet.empty
 
 -- | Pushes a new mapping onto the context (stack-like).
 pushMapping :: Int -> MappingContext -> MappingContext
@@ -95,11 +102,11 @@ setRefinement key nodeID r =
         Just oldID ->
             let newMap = IntMap.insert key nodeID (mrRefinements r)
                 newHash = mrHash r `xor` fromIntegral (hash (key, oldID)) `xor` fromIntegral (hash (key, nodeID))
-            in r { mrRefinements = newMap, mrHash = newHash }
+            in r { mrRefinements = newMap, mrHash = newHash, mrChanged = IntSet.insert key (mrChanged r) }
         Nothing ->
             let newMap = IntMap.insert key nodeID (mrRefinements r)
                 newHash = mrHash r `xor` fromIntegral (hash (key, nodeID))
-            in r { mrRefinements = newMap, mrHash = newHash }
+            in r { mrRefinements = newMap, mrHash = newHash, mrChanged = IntSet.insert key (mrChanged r) }
 
 -- | Removes a refinement.
 deleteRefinement :: Int -> MappingRefinements -> MappingRefinements
@@ -109,7 +116,7 @@ deleteRefinement key r =
         Just oldID ->
             let newMap = IntMap.delete key (mrRefinements r)
                 newHash = mrHash r `xor` fromIntegral (hash (key, oldID))
-            in r { mrRefinements = newMap, mrHash = newHash }
+            in r { mrRefinements = newMap, mrHash = newHash, mrChanged = IntSet.insert key (mrChanged r) }
 
 -- | Retrieves a persistent refinement.
 getRefinement :: Int -> MappingRefinements -> Maybe Word32
@@ -123,3 +130,10 @@ unsafeGetTag _ _ = 0
 -- ONLY for use in tests.
 unsafeGetId :: Int -> MappingRefinements -> Word32
 unsafeGetId idx r = IntMap.findWithDefault 0 idx (mrRefinements r)
+
+-- | The keys changed since the last 'clearChanged'.
+changedKeys :: MappingRefinements -> IntSet
+changedKeys = mrChanged
+
+clearChanged :: MappingRefinements -> MappingRefinements
+clearChanged r = r { mrChanged = IntSet.empty }

@@ -199,6 +199,78 @@ ppTypeError = \case
     CustomError msg -> pretty msg
     RefinedVariantMismatch -> "refined variant mismatch"
     RefinedNullabilityMismatch -> "refined nullability mismatch"
+    RefinedCastMismatch -> "cast between incompatible types"
+    ArgumentTooShort f i needed known ->
+        "argument" <+> literalStyle (pretty i) <+> "of" <+> varStyle (pretty f) <+> "needs" <+> literalStyle (pretty needed)
+            <+> "elements, but" <+> maybe "its size isn't known" (\k -> "it's only known to have" <+> literalStyle (pretty k)) known
+    ArgumentTooSmall f i needed known ->
+        "argument" <+> literalStyle (pretty i) <+> "of" <+> varStyle (pretty f) <+> "must be at least" <+> literalStyle (pretty needed)
+            <> ", but" <+> maybe "nothing is known about it" (\k -> "it's only known to be at least" <+> literalStyle (pretty k)) known
+    ArgumentTooBig f i most known ->
+        "argument" <+> literalStyle (pretty i) <+> "of" <+> varStyle (pretty f) <+> "must be at most" <+> literalStyle (pretty most)
+            <> ", but" <+> maybe "nothing is known about it" (\k -> "it can be up to" <+> literalStyle (pretty k)) known
+    PointeeTooBig f i most known ->
+        "what argument" <+> literalStyle (pretty i) <+> "of" <+> varStyle (pretty f) <+> "points to must be at most" <+> literalStyle (pretty most)
+            <> ", but" <+> maybe "nothing is known about it" (\k -> "it can be up to" <+> literalStyle (pretty k)) known
+    ArgumentsUnbalanced f terms c known ->
+        let argument i = "argument" <+> literalStyle (pretty i)
+            times n i = if n == 1 then argument i else literalStyle (pretty n) <+> "times" <+> argument i
+            -- A side of the sum: what's added to it (True) or taken off.
+            parts ts k = [ (n > 0, times (abs n) i) | (n, i) <- ts ] ++ [ (k > 0, literalStyle (pretty (abs k))) | k /= 0 ]
+            side ps = case ps of
+                (True, x) : rest -> hsep (x : concatMap op rest)
+                _                -> hsep (literalStyle "0" : concatMap op ps)
+            op (plus, x) = [if plus then "+" else "-", x]
+            relation = case break ((== 1) . fst) terms of
+                (before, (_, i) : after) ->
+                    argument i <+> "of" <+> varStyle (pretty f) <+> "must be at least"
+                        <+> side (parts [ (negate n, j) | (n, j) <- before ++ after ] (negate c))
+                _ -> "the arguments of" <+> varStyle (pretty f) <+> "must make" <+> side (parts terms c) <+> "at least 0"
+        in relation <> ", but" <+> maybe "nothing is known about how they relate" (\k -> "it's only known to be" <+> literalStyle (pretty (negate k)) <+> "short") known
+    SignedOverflow lo hi least most ->
+        "signed arithmetic may overflow: it can be from" <+> maybe "any number" (literalStyle . pretty) lo
+            <+> "to" <+> maybe "any number" (literalStyle . pretty) hi
+            <> ", but its type only holds" <+> literalStyle (pretty least) <+> "to" <+> literalStyle (pretty most)
+    AssertMayFail cond ->
+        "assert may fail:" <+> literalStyle (pretty cond) <+> "isn't known to hold here"
+    PlatformOutsideItsLayer what ->
+        varStyle (pretty what) <+> "is the operating system's: only the platform's own files (os_*.c) may use it"
+    NegativeToUnsigned what ty least ->
+        varStyle (pretty what) <+> "may be negative where it's converted to" <+> varStyle (pretty ty)
+            <> ", which changes it: it can be as low as" <+> maybe "any number" (literalStyle . pretty) least
+    TooBigForSigned what ty most ->
+        varStyle (pretty what) <+> "may be too big for" <+> varStyle (pretty ty) <+> "where it's converted to it"
+            <> ", which changes it: it can be as high as" <+> maybe "any number" (literalStyle . pretty) most
+    IndexOutOfBounds arr ix known least most ->
+        varStyle (pretty ix) <+> "may be out of bounds of" <+> varStyle (pretty arr) <> ": it can be from"
+            <+> maybe "any number" (literalStyle . pretty) least <+> "to" <+> maybe "any number" (literalStyle . pretty) most
+            <> "," <+> maybe "and its size isn't known" (\k -> "and it's known to have" <+> literalStyle (pretty k)) known
+    PointerPastEnd ptr by known least most ->
+        varStyle (pretty ptr <+> "+" <+> pretty by) <+> "may be past the end of" <+> varStyle (pretty ptr) <> ":" <+> varStyle (pretty by)
+            <+> "can be from" <+> maybe "any number" (literalStyle . pretty) least <+> "to" <+> maybe "any number" (literalStyle . pretty) most
+            <> "," <+> maybe "and its size isn't known" (\k -> "and it's known to have" <+> literalStyle (pretty k)) known
+    MayBeNull what use surely ->
+        let state = if surely then "is null" else "may be null"
+        in case use of
+            Dereferenced     -> varStyle (pretty what) <+> state <+> "where it's dereferenced"
+            Called           -> varStyle (pretty what) <+> state <+> "where it's called"
+            ArgumentOf f i   -> varStyle (pretty what) <+> state <> ", but argument" <+> literalStyle (pretty i) <+> "of" <+> varStyle (pretty f) <+> "must not be"
+            StoredIn place   -> varStyle (pretty what) <+> state <> ", but" <+> varStyle (pretty place) <+> "must not be"
+            ReturnedFrom f   -> varStyle (pretty what) <+> state <> ", but what" <+> varStyle (pretty f) <+> "returns must not be"
+    ArgumentShorterThanLength f i j known most ->
+        "argument" <+> literalStyle (pretty i) <+> "of" <+> varStyle (pretty f) <+> "may have fewer elements than argument" <+> literalStyle (pretty j) <+> "says:"
+            <+> maybe "its size isn't known" (\k -> "it's known to have" <+> literalStyle (pretty k)) known
+            <> "," <+> maybe "and nothing is known about the length" (\m -> "and the length can be up to" <+> literalStyle (pretty m)) most
+    ArgumentShorterThanNeeded f i known most ->
+        "argument" <+> literalStyle (pretty i) <+> "of" <+> varStyle (pretty f) <+> "may have fewer elements than it needs:"
+            <+> maybe "its size isn't known" (\k -> "it's known to have" <+> literalStyle (pretty k)) known
+            <> "," <+> maybe "and nothing is known about how many it needs" (\m -> "and it may need" <+> literalStyle (pretty m)) most
+    BufferShorterThanLength buf len known most ->
+        varStyle (pretty buf) <+> "may have fewer elements than" <+> varStyle (pretty len) <+> "says:"
+            <+> maybe "its size isn't known" (\k -> "it's known to have" <+> literalStyle (pretty k)) known
+            <> "," <+> maybe "and nothing is known about the length" (\m -> "and the length can be up to" <+> literalStyle (pretty m)) most
+    CountAboveCapacity count capacity ->
+        varStyle (pretty count) <+> "may be more than" <+> varStyle (pretty capacity)
 
 ppMismatchDetail :: MismatchDetail p -> Doc AnsiStyle
 ppMismatchDetail = \case
@@ -227,6 +299,7 @@ ppQualifier = keywordStyle . \case
     QOwner -> "owner"
     QNonnull -> "nonnull"
     QNullable -> "nullable"
+    QNullUnspecified -> "null_unspecified"
     QConst -> "const"
 
 ppProvenance :: Provenance p -> Doc AnsiStyle

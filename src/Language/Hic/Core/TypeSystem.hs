@@ -564,7 +564,9 @@ pattern Unsupported t = Fix (UnsupportedF t)
 
 {-# COMPLETE TypeRef, Pointer, Sized, Const, Owner, Nonnull, Nullable, Qualified, BuiltinType, ExternalType, Array, Var, Function, Template, Singleton, VarArg, IntLit, NameLit, EnumMem, Unconstrained, Conflict, Proxy, Unsupported #-}
 
-data Qualifier = QOwner | QNullable | QNonnull | QConst
+-- | 'QNullUnspecified' is only an array's: a pointer is of unspecified
+-- nullability unless it says otherwise, and an array is non-null.
+data Qualifier = QOwner | QNullable | QNonnull | QConst | QNullUnspecified
     deriving (Show, Read, Eq, Ord, Generic, Enum, Bounded)
 
 instance ToJSON Qualifier
@@ -649,24 +651,28 @@ toFlat ty = go Set.empty Nothing (normalizeType ty)
         UnconstrainedF -> FlatType UnconstrainedF (normalizeQuals (Set.insert QNonnull qs)) Nothing
         ConflictF      -> FlatType ConflictF (normalizeQuals (Set.insert QNullable $ Set.insert QConst $ Set.insert QOwner qs)) Nothing
         BuiltinTypeF NullPtrTy | QNonnull `Set.member` qs -> FlatType UnconstrainedF (normalizeQuals qs) Nothing
-        SingletonF NullPtrTy 0 | QNonnull `Set.member` qs -> FlatType UnconstrainedF (normalizeQuals qs) Nothing
+        SingletonF NullPtrTy _ | QNonnull `Set.member` qs -> FlatType UnconstrainedF (normalizeQuals qs) Nothing
         QualifiedF qs' t -> go (qs <> qs') sz t
         SizedF t l  -> go qs (sz <|> Just l) t
         VarF _ t    -> go qs sz t
         ProxyF t    -> go qs sz t
         _           ->
             let qs' = case f of
-                        PointerF _  -> qs
-                        TemplateF _ -> qs
-                        TypeRefF {} -> qs
-                        FunctionF {} -> Set.insert QNonnull qs
-                        ArrayF {}    -> Set.insert QNonnull qs
+                        PointerF _  -> Set.delete QNullUnspecified qs
+                        TemplateF _ -> Set.delete QNullUnspecified qs
+                        TypeRefF {} -> Set.delete QNullUnspecified qs
+                        FunctionF {} -> Set.insert QNonnull (Set.delete QNullUnspecified qs)
+                        ArrayF {} | Set.member QNullUnspecified qs -> qs
+                                  | otherwise -> Set.insert QNonnull qs
                         _           -> Set.filter (\q -> q == QConst || q == QNonnull || q == QNullable) qs
             in FlatType f (normalizeQuals qs') sz
 
+-- | Of 2 nullabilities, the one that allows more.
 normalizeQuals :: Set Qualifier -> Set Qualifier
-normalizeQuals qs =
-    if Set.member QNullable qs then Set.delete QNonnull qs else qs
+normalizeQuals qs
+    | Set.member QNullable qs        = Set.delete QNonnull (Set.delete QNullUnspecified qs)
+    | Set.member QNullUnspecified qs = Set.delete QNonnull qs
+    | otherwise                      = qs
 
 wrapQualified :: Set Qualifier -> TypeInfo p -> TypeInfo p
 wrapQualified qs (Fix (QualifiedF qs' t)) = wrapQualified (qs <> qs') t

@@ -3,6 +3,7 @@
 {-# LANGUAGE OverloadedStrings     #-}
 module Language.Hic.Core.DataFlowSpec where
 
+import           Control.Exception                 (evaluate)
 import           Control.Monad                     (foldM)
 import           Control.Monad.Identity            (Identity (..), runIdentity)
 import           Data.Fix                          (Fix (..))
@@ -19,6 +20,7 @@ import qualified Language.Cimple                   as C
 import           Language.Cimple.Pretty            (showNode, showNodePlain)
 import           Language.Hic.Core.DataFlow
 import           Language.Hic.Inference.EngineSpec (mustParseNodes)
+import           System.Timeout                    (timeout)
 import           Test.Hspec                        (Spec, describe,
                                                     expectationFailure, it,
                                                     pendingWith, shouldBe)
@@ -65,6 +67,19 @@ instance DataFlow Identity Empty Text StatementCoverage () where
         then return (StatementCoverage facts, Set.empty)
         else return (StatementCoverage $ Set.insert (showNodePlain stmt) facts, Set.empty)
 
+-- | How many times @x@ was assigned on the way here, or 'Nothing' for "many".
+-- In a loop this grows every time round, so only widening makes it stop.
+newtype AssignCount = AssignCount (Maybe Int)
+    deriving (Eq, Show)
+
+instance DataFlow Identity Empty Text AssignCount () where
+    emptyFacts _ = return $ AssignCount (Just 0)
+    join _ (AssignCount a) (AssignCount b) = return $ AssignCount (max <$> a <*> b)
+    widen _ old new = return $ if old == new then new else AssignCount Nothing
+    transfer _ _ _ (AssignCount n) (Fix (C.ExprStmt (Fix (C.AssignExpr (Fix (C.VarExpr (C.L _ _ "x"))) _ _)))) =
+        return (AssignCount ((+ 1) <$> n), Set.empty)
+    transfer _ _ _ facts _ = return (facts, Set.empty)
+
 -- | Find the unique exit node of a CFG.
 findExitNodeId :: CFG Text a -> Int
 findExitNodeId cfg =
@@ -97,6 +112,21 @@ findElseNodeIdOfIfContainingStmt predicate cfg =
 
 spec :: Spec
 spec = do
+    describe "Widening" $ do
+        it "stops facts that grow every time round a loop" $ do
+            ast <- mustParseNodes
+                [ "void f(int n) {"
+                , "  while (n) {"
+                , "    x = 1;"
+                , "  }"
+                , "}"
+                ]
+            let funcBody = case ast of (x:_) -> x; [] -> error "empty ast"
+            let cfg = runIdentity $ buildCFG empty funcBody (AssignCount (Just 0)) :: CFG Text AssignCount
+            let (finalCfg, _) = runIdentity $ fixpoint empty "f" cfg
+            result <- timeout 5000000 $ evaluate $ cfgOutFacts (fromJust (Map.lookup (findExitNodeId finalCfg) finalCfg))
+            result `shouldBe` Just (AssignCount Nothing)
+
     describe "Reaching Definitions" $ do
         it "should calculate the reaching definitions for a simple function" $ do
             ast <- mustParseNodes

@@ -198,8 +198,13 @@ spec = do
             IntMap.size (gNodes gRes) `shouldBe` 2
 
     describe "properties" $ do
+        it "numbers a graph the same whatever its node ids" $ do
+            let g1 = Graph (IntMap.fromList [(0, Branch 1 2), (1, Leaf 7), (2, Branch 1 1)]) 0
+                g2 = Graph (IntMap.fromList [(5, Leaf 7), (3, Branch 5 5), (9, Branch 5 3)]) 9
+            canonical g1 `shouldBe` canonical g2
+
         it "minimize is idempotent" $ property $ \(g :: Graph TestF) ->
-            minimize IntMap.empty [] (minimize IntMap.empty [] g) == minimize IntMap.empty [] g
+            canonical (minimize IntMap.empty [] (minimize IntMap.empty [] g)) == canonical (minimize IntMap.empty [] g)
 
         it "universalProduct is commutative" $ property $ \(g1 :: Graph TestF) (g2 :: Graph TestF) ->
             let combine i j () = case (getNode g1 i, getNode g2 j) of
@@ -210,7 +215,7 @@ spec = do
                 g12 = universalProduct combine IntMap.empty [] [()] g1 g2 ()
                 swapTriple (i', j', s') = (j', i', s')
                 g21 = universalProduct (\j i s -> swapTriple <$> combine i j s) IntMap.empty [] [()] g2 g1 ()
-            in minimize IntMap.empty [] g12 == minimize IntMap.empty [] g21
+            in canonical (minimize IntMap.empty [] g12) == canonical (minimize IntMap.empty [] g21)
 
         it "universalProduct is associative" $ property $ \(g1 :: Graph TestF) (g2 :: Graph TestF) (g3 :: Graph TestF) ->
             let combine12 i j () = case (getNode g1 i, getNode g2 j) of
@@ -243,7 +248,7 @@ spec = do
                         (_, Leaf v23) -> Leaf v23
                 g1_23 = universalProduct combine1_23 IntMap.empty [] [()] g1 g23 ()
 
-            in minimize IntMap.empty [] g12_3 == minimize IntMap.empty [] g1_23
+            in canonical (minimize IntMap.empty [] g12_3) == canonical (minimize IntMap.empty [] g1_23)
 
         it "merges a regular node into a structured terminal if bisimilar" $ do
             -- Terminal -1 has structure Leaf 10

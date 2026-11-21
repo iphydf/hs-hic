@@ -834,4 +834,4 @@ extractConstraints ts path node startId startCallSiteId =
         dtys <- forM arrs $ \case
             Fix (C.DeclSpecArray _ (Just s)) -> inferExpr s
             _ -> return Unconstrained
-        return $ Array (Just ty) dtys
+        return $ TS.declaredArray arrs (Array (Just ty) dtys)

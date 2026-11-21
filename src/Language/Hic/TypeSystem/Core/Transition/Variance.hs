@@ -16,22 +16,23 @@ import           Language.Hic.TypeSystem.Core.Transition.Types
 -- must be forced (forceConst) to maintain soundness in an invariant context.
 getTargetState :: (Eq a)
                => ProductState
-               -> (a, a)      -- ^ (Bottom terminal, Top terminal)
+               -> (a -> Bool) -- ^ Whether a node is the identity or the zero of
+                              -- this polarity: either way, the other side
+                              -- needn't be the same at an invariant level
                -> (a -> (Nullability, Ownership, Constness)) -- ^ Qualifier lookup
                -> Constness   -- ^ Qualifier of the current Left node
                -> Constness   -- ^ Qualifier of the current Right node
                -> a           -- ^ Left child node ID
                -> a           -- ^ Right child node ID
                -> (ProductState, Bool)
-getTargetState ProductState{..} terminals getQuals _cL _cR tL tR =
+getTargetState ProductState{..} isTerminal getQuals _cL _cR tL tR =
     let (_, _, cChildL) = getQuals tL
         (_, _, cChildR) = getQuals tR
 
         nextL = stepQual psQualL (cChildL == QConst')
         nextR = stepQual psQualR (cChildR == QConst')
 
-        isIdentity t = t == (if psPolarity == PJoin then fst terminals else snd terminals)
-        isNeutral = isIdentity tL || isIdentity tR
+        isNeutral = isTerminal tL || isTerminal tR
 
         canJoin = isNeutral || psPolarity == PMeet || tL == tR || allowCovariance psQualL || allowCovariance psQualR
     in (ProductState psPolarity nextL nextR False, canJoin)

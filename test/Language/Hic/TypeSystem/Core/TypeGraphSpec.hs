@@ -21,6 +21,8 @@ import           Language.Hic.TypeSystem.Core.Base             (Phase (..),
                                                                 pattern Conflict,
                                                                 pattern Const,
                                                                 pattern Function,
+                                                                pattern Nonnull,
+                                                                pattern Nullable,
                                                                 pattern Pointer,
                                                                 pattern Singleton,
                                                                 pattern Sized,
@@ -241,6 +243,19 @@ spec = do
         Lattice.subtypeOf a b `shouldBe` True
         Lattice.subtypeOf b c `shouldBe` True
         Lattice.subtypeOf a c `shouldBe` True
+
+    describe "substitute" $ do
+        let v = TS.FullTemplate (TS.TIdSolver 0 Nothing) Nothing
+            t = Template (TS.ftId v) (TS.ftIndex v)
+            subst val ty = toTypeInfo (substitute v (fromTypeInfo val) (fromTypeInfo ty))
+
+        it "keeps a Nonnull value in an unqualified template" $
+            subst (Nonnull (Pointer (BuiltinType S32Ty))) (Pointer t)
+                `shouldBe` Pointer (Nonnull (Pointer (BuiltinType S32Ty)))
+
+        it "lets a Nullable template override a Nonnull value" $
+            subst (Nonnull (Pointer (BuiltinType S32Ty))) (Nullable t)
+                `shouldBe` Nullable (Pointer (BuiltinType S32Ty))
 
     describe "lfp (Least Fixed Point)" $ do
         it "introduces a cycle for a simple self-reference X = Pointer X" $ do

@@ -13,6 +13,7 @@ module Language.Hic.Refined.Inference.Substitution
     , collectRefinableVars
     , refreshInstance
     , refreshSignature
+    , ownSignature
     , register
     ) where
 
@@ -130,6 +131,9 @@ substituteReturnType lookupFunc = \case
     RetVal v -> RetVal <$> substitute lookupFunc v
     RetVoid -> return RetVoid
 
+-- | The type variables of a value's own storage. A struct pointed to is
+-- another object, with its own instance of its parameters (read as skolems of
+-- that instance), so it adds none.
 collectRefinableVars :: Word32 -> State TranslatorState (Set TemplateId)
 collectRefinableVars nid = do
     modify $ \s -> s { tsSubstCache = Map.empty }
@@ -145,6 +149,11 @@ collectRefinableVars' visited nid
             Just (AnyRigidNodeF n) -> foldMapVar (Set.insert nid visited) n
             Nothing                -> return Set.empty
   where
+    pointee vset o = do
+        st <- get
+        case Map.lookup o (tsNodes st) of
+            Just (AnyRigidNodeF (RObject VNominal{} _)) -> return Set.empty
+            _                                           -> collectRefinableVars' vset o
     foldMapVar :: Set Word32 -> RigidNodeF k TemplateId Word32 -> State TranslatorState (Set TemplateId)
     foldMapVar vset = \case
         RObject s _ -> case s of
@@ -159,7 +168,7 @@ collectRefinableVars' visited nid
             _ -> return Set.empty
         RReference r _ _ _ -> case r of
             Ptr t -> case t of
-                TargetObject o -> collectRefinableVars' vset o
+                TargetObject o -> pointee vset o
                 TargetFunction args ret -> do
                     as <- mapM (collectRefinableVars' vset) args
                     rs <- case ret of { RetVal v -> collectRefinableVars' vset v; RetVoid -> return Set.empty }
@@ -185,6 +194,24 @@ refreshVars mkTid vars = do
         return (tid, nodeId)
         ) [0..length vars - 1] vars
 
+-- | Gives a function's signature type variables of its own. The global analysis
+-- numbers each definition's parameters from 0, so a signature that names a
+-- typedef's parameter (a callback typedef's @void *@) would otherwise share
+-- that variable with every other function using the typedef. A @void *@
+-- written in the signature itself already has its own.
+ownSignature :: Word32 -> State TranslatorState Word32
+ownSignature nid = do
+    vars <- Set.filter isGlobal <$> collectRefinableVars nid
+    if Set.null vars then return nid
+    else do
+        freshMap <- refreshVars (\nextId i -> TIdParam PLocal (nextId + i) (Just "T")) (Set.toList vars)
+        modify $ \s -> s { tsSubstCache = Map.empty }
+        substitute (return . (`Map.lookup` freshMap)) nid
+  where
+    isGlobal = \case
+        TIdParam PGlobal _ _ -> True
+        _                    -> False
+
 refreshInstance :: Maybe (Lexeme Text) -> Word32 -> State TranslatorState Word32
 refreshInstance loc nid = do
     vars <- collectRefinableVars nid
@@ -207,6 +234,7 @@ refreshInstance loc nid = do
             let node = AnyRigidNodeF (RObject (VVar tid Nothing) (Quals False False))
             modify (addNode freshId node)
             modify (addConstraint loc (PathContext Map.empty Map.empty) freshId nid')
+            modify $ \s -> s { tsDefinitions = Map.insert freshId nid' (tsDefinitions s) }
             return freshId
 
 
@@ -219,7 +247,7 @@ refreshSignature params ret = do
     else do
         st <- get
         let varList = Set.toList vars
-        let varToNode = Map.fromList [ (tid, nid) | (nid, AnyRigidNodeF (RObject (VVar tid _) _)) <- Map.toList (tsNodes st), tid `Set.member` vars ]
+        let varToNode = Map.restrictKeys (tsVarNodes st) vars
 
         let h = fromIntegral (hash allIds)
         freshMap <- refreshVars (\nextId i -> TIdSkolem h h (nextId + i)) varList

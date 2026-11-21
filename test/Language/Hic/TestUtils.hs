@@ -2,6 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Language.Hic.TestUtils
     ( mustParse
+    , mustParseFiles
     , mustParseNodes
     ) where
 
@@ -20,6 +21,11 @@ mustParse code =
         Right nodes -> case C.fromList [("test.c", nodes)] of
             Left err -> fail err
             Right ok -> return ok
+
+mustParseFiles :: (HasCallStack, MonadFail m) => [(FilePath, [Text])] -> m (C.Program Text)
+mustParseFiles files = do
+    asts <- mapM (\(path, code) -> either fail (return . (,) path) (C.parseText (T.unlines code))) files
+    either fail return (C.fromList asts)
 
 mustParseNodes :: (HasCallStack, MonadFail m) => [Text] -> m [C.Node (C.Lexeme Text)]
 mustParseNodes code = do

@@ -1,10 +1,11 @@
 {-# LANGUAGE DataKinds           #-}
+{-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE PatternSynonyms     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 module Language.Hic.TypeSystem.Core.GraphSolverSpec (spec) where
 
-import           Data.Fix                                 (Fix (..))
+import           Data.Fix                                 (Fix (..), foldFix)
 import           Data.Map.Strict                          (Map)
 import qualified Data.Map.Strict                          as Map
 import           Data.Set                                 (Set)
@@ -25,7 +26,6 @@ import           Language.Hic.TypeSystem.Core.Base        (FullTemplate,
 import qualified Language.Hic.TypeSystem.Core.Base        as TS
 import           Language.Hic.TypeSystem.Core.GraphSolver
 import           Language.Hic.TypeSystem.Core.Lattice     (subtypeOf)
-import           Language.Hic.TypeSystem.Core.Solver      (applyBindings)
 import qualified Language.Hic.TypeSystem.Core.TypeGraph   as TG
 import           Test.Hspec
 import           Test.QuickCheck
@@ -81,7 +81,13 @@ spec = do
                             solved = Map.map TG.toTypeInfo solved_g
                             check ft requirements =
                                 let solution = Map.findWithDefault (Template (ftId ft) (ftIndex ft)) ft solved
-                                    appliedReqs = map (applyBindings solved) (Set.toList requirements)
+                                    -- The solver takes a template with its own
+                                    -- id and another index as itself.
+                                    apply = foldFix $ \case
+                                        TemplateF t | ftId t == ftId ft -> solution
+                                        TemplateF t | Just v <- Map.lookup t solved -> v
+                                        f -> Fix f
+                                    appliedReqs = map apply (Set.toList requirements)
                                     failures = filter (not . (`subtypeOf` solution)) appliedReqs
                                 in case failures of
                                     [] -> property True

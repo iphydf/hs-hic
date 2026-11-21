@@ -7,6 +7,9 @@
 
 module Language.Hic.Refined.Transition
     ( TransitionEnv (..)
+    , transitionEnv
+    , betterBinding
+    , existentialIndex
     , StepResult
     , step
     , isRefinable
@@ -27,12 +30,14 @@ import           Data.Hashable                    (hash)
 import qualified Data.IntMap.Merge.Strict         as IntMap
 import           Data.IntMap.Strict               (IntMap)
 import qualified Data.IntMap.Strict               as IntMap
+import           Data.IntSet                      (IntSet)
+import qualified Data.IntSet                      as IntSet
 import qualified Data.List                        as List
 import qualified Data.Map.Merge.Strict            as Map
 import           Data.Map.Strict                  (Map)
 import qualified Data.Map.Strict                  as Map
 import           Data.Maybe                       (fromJust, fromMaybe, isJust,
-                                                   isNothing)
+                                                   isNothing, mapMaybe)
 import           Data.Set                         (Set)
 import qualified Data.Set                         as Set
 import           Data.Text                        (Text)
@@ -144,35 +149,70 @@ stableCompareTID nodes tid1 tid2 = compare (tidIdent' Set.empty tid1) (tidIdent'
 
 -- | The environment for a single step of the Product Automaton.
 data TransitionEnv a = TransitionEnv
-    { teNodes       :: Map Word32 (AnyRigidNodeF TemplateId a)
+    { teNodes        :: Map Word32 (AnyRigidNodeF TemplateId a)
     -- ^ The type graph segment being solved
-    , teRegistry    :: Registry a
+    , teRegistry     :: Registry a
     -- ^ Source of truth for nominal type members
-    , tePolarity    :: Polarity
+    , tePolarity     :: Polarity
     -- ^ Join or Meet
-    , tePathCtx     :: PathContext
+    , tePathCtx      :: PathContext
     -- ^ Local symbolic state for refinement projection
-    , teCurrentPath :: SymbolicPath
+    , teCurrentPath  :: SymbolicPath
     -- ^ Current symbolic cursor (e.g., p->tag)
-    , teTerminals   :: (a, a, a, a)
+    , teTerminals    :: (a, a, a, a)
     -- ^ (Bottom, Any, Conflict, STerminal) IDs for the graph
-    , teRefineL     :: Bool
+    , teRefineL      :: Bool
     -- ^ Whether psNodeL can be refined
-    , teRefineR     :: Bool
+    , teRefineR      :: Bool
     -- ^ Whether psNodeR can be refined
+    , teExistentials :: Map (TemplateId, Int) (AnyRigidNodeF TemplateId a, a)
+    -- ^ The existential wrapping each nominal (name, arity): see 'existentialIndex'.
+    , teVarNodes     :: Map TemplateId a
+    -- ^ The node of each type variable: see 'varNodeIndex'.
+    , teFixed        :: IntSet
+    -- ^ The variables bound to what they're declared as, which no other
+    -- binding replaces.
     }
     deriving (Show, Eq, Ord)
+
+transitionEnv :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> Registry Word32 -> Polarity -> PathContext -> SymbolicPath -> (Word32, Word32, Word32, Word32) -> Bool -> Bool -> TransitionEnv Word32
+transitionEnv nodes registry pol ctx path terminals refineL refineR =
+    TransitionEnv nodes registry pol ctx path terminals refineL refineR (existentialIndex nodes) (varNodeIndex nodes) IntSet.empty
+
+-- | For each refinable type variable, the unqualified node of just that
+-- variable (the smallest if there are several), which stands for the object a
+-- pointer to that opaque type points to.
+varNodeIndex :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> Map TemplateId Word32
+varNodeIndex = Map.fromListWith min . mapMaybe plainVar . Map.toList
+  where
+    plainVar :: (Word32, AnyRigidNodeF TemplateId Word32) -> Maybe (TemplateId, Word32)
+    plainVar (nid, AnyRigidNodeF (RObject (VVar tid Nothing) (Quals False False))) | isRefinable tid = Just (tid, nid)
+    plainVar _ = Nothing
+
+-- | For each nominal (name, arity), the existential that wraps it with that
+-- many binders, the one with the smallest stable identity if there are
+-- several. The graph doesn't change while solving, so it's built once.
+existentialIndex :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> Map (TemplateId, Int) (AnyRigidNodeF TemplateId Word32, Word32)
+existentialIndex nodes =
+    Map.fromListWith pick
+        [ ((name, length tids), (node, nid))
+        | (nid, node@(AnyRigidNodeF (RObject (VExistential tids bodyId) _))) <- Map.toList nodes
+        , Just (AnyRigidNodeF (RObject (VNominal (L _ _ name) ps) _)) <- [Map.lookup bodyId nodes]
+        , length ps == length tids
+        ]
+  where
+    pick a b = if getStableNodeIdent nodes (snd a) <= getStableNodeIdent nodes (snd b) then a else b
 
 -- | The result of a transition step.
 -- Maps to a node where each child is a 'ProductState' (L_id, R_id, Gamma).
 type StepResult = AnyRigidNodeF TemplateId ProductState
 
-getEffectiveNode :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer (Set Int) (Word32, Maybe (AnyRigidNodeF TemplateId Word32))
+getEffectiveNode :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer IntSet (Word32, Maybe (AnyRigidNodeF TemplateId Word32))
 getEffectiveNode nodes refs depth i = case Map.lookup i nodes of
     Just (AnyRigidNodeF (RObject (VVar tid _) _)) | isRefinable tid ->
         let key = variableKey nodes depth tid
         in do
-            tell (Set.singleton key)
+            tell (IntSet.singleton key)
             case getRefinement key refs of
                 Just refinedId | refinedId /= i ->
                     dtrace ("getEffectiveNode: following " ++ show i ++ " (" ++ show tid ++ ") -> " ++ show refinedId) $
@@ -180,7 +220,7 @@ getEffectiveNode nodes refs depth i = case Map.lookup i nodes of
                 _               -> return (i, Map.lookup i nodes)
     n -> return (i, n)
 
-getEffectiveObject :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer (Set Int) (Maybe (ObjectStructure TemplateId Word32))
+getEffectiveObject :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer IntSet (Maybe (ObjectStructure TemplateId Word32))
 getEffectiveObject nodes refs depth rId = do
     (_, mNode) <- getEffectiveNode nodes refs depth rId
     case mNode of
@@ -197,7 +237,7 @@ getEffectiveObject nodes refs depth rId = do
                 VSizeExpr ts      -> VSizeExpr ts
         _ -> return Nothing
 
-isNull :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer (Set Int) Bool
+isNull :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer IntSet Bool
 isNull nodes refs depth i = do
     (_, mNode) <- getEffectiveNode nodes refs depth i
     return $ case mNode of
@@ -205,10 +245,10 @@ isNull nodes refs depth i = do
         Just (AnyRigidNodeF (RTerminal SBottom))              -> True
         _                                                     -> False
 
-isBot :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer (Set Int) Bool
+isBot :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer IntSet Bool
 isBot nodes refs depth i = fst <$> isBot' Map.empty Set.empty nodes refs depth i
 
-isBot' :: Map Word32 Bool -> Set Word32 -> Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer (Set Int) (Bool, Map Word32 Bool)
+isBot' :: Map Word32 Bool -> Set Word32 -> Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer IntSet (Bool, Map Word32 Bool)
 isBot' memo visited nodes refs depth i
     | Just res <- Map.lookup i memo = return (res, memo)
     | Set.member i visited = return (False, memo)
@@ -229,10 +269,10 @@ isBot' memo visited nodes refs depth i
                         go memo (foldMap (:[]) n)
             _ -> return (False, Map.insert i False memo)
 
-isTop :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer (Set Int) Bool
+isTop :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer IntSet Bool
 isTop nodes refs depth i = fst <$> isTop' Map.empty Set.empty nodes refs depth i
 
-isTop' :: Map Word32 Bool -> Set Word32 -> Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer (Set Int) (Bool, Map Word32 Bool)
+isTop' :: Map Word32 Bool -> Set Word32 -> Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer IntSet (Bool, Map Word32 Bool)
 isTop' memo visited nodes refs depth i
     | Just res <- Map.lookup i memo = return (res, memo)
     | Set.member i visited = return (False, memo)
@@ -255,7 +295,7 @@ isTop' memo visited nodes refs depth i
                     go memo (foldMap (:[]) n)
             _ -> return (False, Map.insert i False memo)
 
-isNonnull :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer (Set Int) Bool
+isNonnull :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Writer IntSet Bool
 isNonnull nodes refs depth i = do
     (_, mNode) <- getEffectiveNode nodes refs depth i
     return $ case mNode of
@@ -270,7 +310,7 @@ stepMismatch pol refs = case pol of
     PMeet -> (AnyRigidNodeF (RTerminal SConflict), refs) -- Conflict during refinement
 
 -- | Handles function cases in the Product Automaton.
-stepFunction :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe (AnyRigidNodeF TemplateId Word32) -> Writer (Set Int) (Maybe (StepResult, MappingRefinements))
+stepFunction :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe (AnyRigidNodeF TemplateId Word32) -> Writer IntSet (Maybe (StepResult, MappingRefinements))
 stepFunction env ps refs nodeL nodeR =
     let gamma = psGamma ps
         depthL = psDepthL ps
@@ -290,7 +330,7 @@ stepFunction env ps refs nodeL nodeR =
         _ -> return Nothing
 
 -- | Handles reference cases (pointers and arrays) in the Product Automaton.
-stepReference :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe (AnyRigidNodeF TemplateId Word32) -> Writer (Set Int) (Maybe (StepResult, MappingRefinements))
+stepReference :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe (AnyRigidNodeF TemplateId Word32) -> Writer IntSet (Maybe (StepResult, MappingRefinements))
 stepReference env ps refs nodeL nodeR =
     let nodes = teNodes env
         gamma = psGamma ps
@@ -313,7 +353,7 @@ stepReference env ps refs nodeL nodeR =
                 oRes = case pol of
                     PJoin -> min oL oR -- Join(Owned, NonOwned) = NonOwned
                     PMeet -> max oL oR -- Meet(Owned, NonOwned) = Owned
-            in case (sL, sR) of
+            in case decayArray sL sR of
                 (Ptr pL, Ptr pR) -> do
                     let isTargetBot' d  = \case { TargetObject i -> isBot nodes refs d i; _ -> return False }
                         isTargetTop' d  = \case { TargetObject i -> isTop nodes refs d i; _ -> return False }
@@ -330,16 +370,19 @@ stepReference env ps refs nodeL nodeR =
                             PMeet -> resIsBotL || resIsBotR
                             PJoin -> resIsBotL && resIsBotR
 
-                    -- Contradiction check: Nonnull pointer to NULL.
-                    botR <- isBot nodes refs depthR (psNodeR ps)
-                    botL <- isBot nodes refs depthL (psNodeL ps)
-                    botPL <- isTargetBot' depthL pL
-                    botPR <- isTargetBot' depthR pR
+                    -- Contradiction check: Nonnull pointer to NULL. A pointer isn't Bottom
+                    -- itself, so for an object target that's the target walk above.
+                    botR <- case pR of
+                        TargetObject _ -> return resIsBotR
+                        _              -> isBot nodes refs depthR (psNodeR ps)
+                    botL <- case pL of
+                        TargetObject _ -> return resIsBotL
+                        _              -> isBot nodes refs depthL (psNodeL ps)
                     let isNonnullContradiction = pol == PMeet &&
                             ( (nL == QNonnull' && botR)
                             || (nR == QNonnull' && botL)
-                            || (nL == QNonnull' && botPL)
-                            || (nR == QNonnull' && botPR) )
+                            || (nL == QNonnull' && resIsBotL)
+                            || (nR == QNonnull' && resIsBotR) )
 
                     dtrace ("step RReference: isNonnullContra=" ++ show isNonnullContradiction ++ " resIsBot=" ++ show resIsBot ++ " resIsConflict=" ++ show resIsConflict) $
                        if isNonnullContradiction || resIsConflict
@@ -363,10 +406,12 @@ stepReference env ps refs nodeL nodeR =
                             PMeet -> topL || topR
                     if resIsBot then return $ Just (AnyRigidNodeF (RTerminal SBottom), refs)
                     else if resIsTop then return $ Just (AnyRigidNodeF (RTerminal SConflict), refs)
-                    else if length dL /= length dR then return $ Just (AnyRigidNodeF (RTerminal SConflict), refs)
+                    -- An array without dimensions (x[], a VLA) is of any size.
+                    else if not (null dL) && not (null dR) && length dL /= length dR then return $ Just (AnyRigidNodeF (RTerminal SConflict), refs)
                     else do
+                        let (dL', dR') = if null dL || null dR then ([], []) else (dL, dR)
                         (refs1, eStates) <- refineParams env pol oneWay gamma depthL depthR (psParentVar ps) (psOrigin ps) (psFile ps) refs [Covariant] [eL] [eR]
-                        (newRefs, dStates) <- refineParams env pol oneWay gamma depthL depthR (psParentVar ps) (psOrigin ps) (psFile ps) refs1 (replicate (length dL) Covariant) dL dR
+                        (newRefs, dStates) <- refineParams env pol oneWay gamma depthL depthR (psParentVar ps) (psOrigin ps) (psFile ps) refs1 (replicate (length dL') Covariant) dL' dR'
                         case eStates of
                             [eState] -> return $ Just (AnyRigidNodeF (RReference (Arr eState dStates) nRes oRes qRes), newRefs)
                             _        -> return $ Just (AnyRigidNodeF (RTerminal SConflict), refs)
@@ -374,8 +419,17 @@ stepReference env ps refs nodeL nodeR =
                 _ -> return $ Just (AnyRigidNodeF (RTerminal SConflict), refs)
         _ -> return Nothing
 
+-- | An array meets a pointer as a pointer to its elements, as in C. This is
+-- symmetric like every lattice operation: passing a plain pointer where an
+-- array is required is checked at the call site, which knows the direction.
+decayArray :: RefStructure tid a -> RefStructure tid a -> (RefStructure tid a, RefStructure tid a)
+decayArray l r = case (l, r) of
+    (Arr e _, Ptr _) -> (Ptr (TargetObject e), r)
+    (Ptr _, Arr e _) -> (l, Ptr (TargetObject e))
+    _                -> (l, r)
+
 -- | Handles object structure cases in the Product Automaton.
-stepObject :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe (AnyRigidNodeF TemplateId Word32) -> Writer (Set Int) (Maybe (StepResult, MappingRefinements))
+stepObject :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe (AnyRigidNodeF TemplateId Word32) -> Writer IntSet (Maybe (StepResult, MappingRefinements))
 stepObject env ps refs nodeL nodeR = do
     let nodes = teNodes env
         gamma = psGamma ps
@@ -475,7 +529,7 @@ stepObject env ps refs nodeL nodeR = do
                                        (True, True) -> do
                                            let keyL = variableKey (teNodes env) depthL tidL
                                                keyR = variableKey (teNodes env) depthR tidR
-                                           tell (Set.fromList [keyL, keyR])
+                                           tell (IntSet.fromList [keyL, keyR])
                                            case (getRefinement keyL refs, getRefinement keyR refs) of
                                                (Just oldL, _) | oldL /= psNodeL ps ->
                                                    return $ Just (AnyRigidNodeF (RTerminal (STerminal $ ProductState oldL (psNodeR ps) pol oneWay gamma depthL depthR (psParentVar ps) (psOrigin ps) (psFile ps))), refs)
@@ -584,7 +638,7 @@ stepObject env ps refs nodeL nodeR = do
         _ -> return Nothing
 
 -- | Handles general variable refinement cases in the Product Automaton.
-stepVariable :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe (AnyRigidNodeF TemplateId Word32) -> Writer (Set Int) (Maybe (StepResult, MappingRefinements))
+stepVariable :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe (AnyRigidNodeF TemplateId Word32) -> Writer IntSet (Maybe (StepResult, MappingRefinements))
 stepVariable env ps refs nodeL nodeR =
     case (nodeL, nodeR) of
         -- 3. General Variable Refinement (Category-independent placeholders)
@@ -598,7 +652,7 @@ stepVariable env ps refs nodeL nodeR =
         _ -> return Nothing
 
 -- | Handles terminal node cases in the Product Automaton.
-stepTerminal :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe (AnyRigidNodeF TemplateId Word32) -> Writer (Set Int) (Maybe (StepResult, MappingRefinements))
+stepTerminal :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Maybe (AnyRigidNodeF TemplateId Word32) -> Maybe (AnyRigidNodeF TemplateId Word32) -> Writer IntSet (Maybe (StepResult, MappingRefinements))
 stepTerminal env ps refs nodeL nodeR =
     let nodes = teNodes env
         gamma = psGamma ps
@@ -701,14 +755,17 @@ stepTerminal env ps refs nodeL nodeR =
 
 -- | A single step of the Product Automaton.
 -- Performs local pattern matching on two nodes and returns the structural product.
-step :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> (StepResult, MappingRefinements, Set Int)
-step env ps refs =
+step :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> (StepResult, MappingRefinements, IntSet)
+step env ps refs0 =
     let nodes = teNodes env
         depthL = psDepthL ps
         depthR = psDepthR ps
 
-        ((effIdL, nodeL), depsL) = runWriter $ getEffectiveNode nodes refs depthL (psNodeL ps)
-        ((effIdR, nodeR), depsR) = runWriter $ getEffectiveNode nodes refs depthR (psNodeR ps)
+        ((effIdL, nodeL), depsL) = runWriter $ getEffectiveNode nodes refs0 depthL (psNodeL ps)
+        ((effIdR, nodeR), depsR) = runWriter $ getEffectiveNode nodes refs0 depthR (psNodeR ps)
+
+        -- This step compares the two either way.
+        refs = rebindBetter env depthL (psNodeL ps) effIdL depthR (psNodeR ps) effIdR refs0
 
         pol = psPolarity ps
 
@@ -726,20 +783,68 @@ step env ps refs =
                                 Nothing -> return Nothing
 
         (res, finalRefs) = fromMaybe (stepMismatch pol refs) mRes
-        allDeps = Set.unions [depsL, depsR, depsStep]
+        allDeps = IntSet.unions [depsL, depsR, depsStep]
 
     in dtrace ("step: L=" ++ show (psNodeL ps) ++ " R=" ++ show (psNodeR ps) ++ " pol=" ++ show pol ++ " effL=" ++ show effIdL ++ " effR=" ++ show effIdR ++ " parent=" ++ show (psParentVar ps)) $
        (res, finalRefs, allDeps)
 
+-- | Whether a variable is better bound to one node than another: to an
+-- existential (what joining different instances promotes it to), then to
+-- another type rather than a terminal, then to the node made first, and
+-- least to bottom, which says nothing of it. A bound
+-- variable that meets another node takes the better, so its binding doesn't
+-- depend on the order the solver meets them in, and as bindings only get
+-- better, the solver ends.
+betterBinding :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> Word32 -> Word32 -> Bool
+betterBinding nodes a b = rank a < rank b
+  where
+    rank i = (kind (Map.lookup i nodes), i)
+    kind :: Maybe (AnyRigidNodeF TemplateId Word32) -> Int
+    kind = \case
+        Just (AnyRigidNodeF (RObject VExistential{} _)) -> 0
+        Just (AnyRigidNodeF (RTerminal SBottom))        -> 3
+        Just (AnyRigidNodeF RTerminal{})                -> 2
+        _                                               -> 1
+
+-- | The key of the variable a bound variable node resolves through: the last
+-- in its chain of variables bound to variables.
+boundVarKey :: Map Word32 (AnyRigidNodeF TemplateId Word32) -> MappingRefinements -> Int -> Word32 -> Maybe Int
+boundVarKey nodes refs depth i = case Map.lookup i nodes of
+    Just (AnyRigidNodeF (RObject (VVar tid _) _)) | isRefinable tid ->
+        let key = variableKey nodes depth tid
+        in case getRefinement key refs of
+            Just next | next /= i -> boundVarKey nodes refs depth next <|> Just key
+            _                     -> Nothing
+    _ -> Nothing
+
+-- | A bound variable meeting another node takes the better of the two
+-- ('betterBinding'): given each side's depth, node and the node it resolves to.
+rebindBetter :: TransitionEnv Word32 -> Int -> Word32 -> Word32 -> Int -> Word32 -> Word32 -> MappingRefinements -> MappingRefinements
+rebindBetter env depthL rawL effL depthR rawR effR =
+    rebind (teRefineR env) depthR rawR effR effL . rebind (teRefineL env) depthL rawL effL effR
+  where
+    nodes = teNodes env
+    rebind refine depth raw eff other r
+        | refine, eff /= other, not (isVarNode (Map.lookup other nodes)), betterBinding nodes other eff
+        , Just key <- boundVarKey nodes r depth raw, not (IntSet.member key (teFixed env)) = setRefinement key other r
+        | otherwise = r
+
+isVarNode :: Maybe (AnyRigidNodeF TemplateId Word32) -> Bool
+isVarNode (Just (AnyRigidNodeF (RObject VVar{} _))) = True
+isVarNode _                                         = False
+
 -- | Sequential refinement propagation for collections of types.
-refineParams :: TransitionEnv Word32 -> Polarity -> Bool -> MappingContext -> Int -> Int -> Maybe (Int, TemplateId) -> Maybe (Lexeme Text) -> Maybe FilePath -> MappingRefinements -> [Variance] -> [Word32] -> [Word32] -> Writer (Set Int) (MappingRefinements, [ProductState])
+refineParams :: TransitionEnv Word32 -> Polarity -> Bool -> MappingContext -> Int -> Int -> Maybe (Int, TemplateId) -> Maybe (Lexeme Text) -> Maybe FilePath -> MappingRefinements -> [Variance] -> [Word32] -> [Word32] -> Writer IntSet (MappingRefinements, [ProductState])
 refineParams env pol oneWay gamma dL dR parentVar loc mFile initialRefs variances ls rs =
     let go refs [] [] [] acc = return (refs, reverse acc)
-        go refs (v:vRest) (lL:lRest) (rR:rRest) acc = do
+        go refs0 (v:vRest) (lL:lRest) (rR:rRest) acc = do
             let p = applyVariance v pol
                 nodes = teNodes env
-            (effL, nodeL) <- getEffectiveNode nodes refs dL lL
-            (effR, nodeR) <- getEffectiveNode nodes refs dR rR
+            (effL, nodeL) <- getEffectiveNode nodes refs0 dL lL
+            (effR, nodeR) <- getEffectiveNode nodes refs0 dR rR
+            -- The child state is of what the two resolve to, so it's here
+            -- that a bound variable meets the other side.
+            let refs = rebindBetter env dL lL effL dR rR effR refs0
 
             -- Preview refinement for VVar
             !newRefs <-
@@ -766,7 +871,7 @@ refineParams env pol oneWay gamma dL dR parentVar loc mFile initialRefs variance
     in go initialRefs variances ls rs []
 
 -- | Sequential refinement for ReturnType.
-refineReturnType :: TransitionEnv Word32 -> Polarity -> Bool -> MappingContext -> Int -> Int -> Maybe (Int, TemplateId) -> Maybe (Lexeme Text) -> Maybe FilePath -> MappingRefinements -> ReturnType Word32 -> ReturnType Word32 -> Writer (Set Int) (MappingRefinements, Maybe (ReturnType ProductState))
+refineReturnType :: TransitionEnv Word32 -> Polarity -> Bool -> MappingContext -> Int -> Int -> Maybe (Int, TemplateId) -> Maybe (Lexeme Text) -> Maybe FilePath -> MappingRefinements -> ReturnType Word32 -> ReturnType Word32 -> Writer IntSet (MappingRefinements, Maybe (ReturnType ProductState))
 refineReturnType env pol oneWay gamma dL dR parentVar loc mFile refs rL rR =
     case (rL, rR) of
         (RetVal lL, RetVal lR) -> do
@@ -778,75 +883,76 @@ refineReturnType env pol oneWay gamma dL dR parentVar loc mFile refs rL rR =
         _ -> return (refs, Nothing)
 
 -- | Traverses PtrTarget structure in the Product Automaton.
-stepPtrTarget :: TransitionEnv Word32 -> Polarity -> Bool -> Word32 -> Word32 -> PtrTarget TemplateId Word32 -> PtrTarget TemplateId Word32 -> MappingContext -> Int -> Int -> Maybe (Int, TemplateId) -> Maybe (Lexeme Text) -> Maybe FilePath -> MappingRefinements -> Writer (Set Int) (Maybe (PtrTarget TemplateId ProductState), MappingRefinements)
-stepPtrTarget env pol oneWay idL idR pL pR gamma dL dR parentVar loc mFile refs =
+stepPtrTarget :: TransitionEnv Word32 -> Polarity -> Bool -> Word32 -> Word32 -> PtrTarget TemplateId Word32 -> PtrTarget TemplateId Word32 -> MappingContext -> Int -> Int -> Maybe (Int, TemplateId) -> Maybe (Lexeme Text) -> Maybe FilePath -> MappingRefinements -> Writer IntSet (Maybe (PtrTarget TemplateId ProductState), MappingRefinements)
+stepPtrTarget env pol oneWay idL idR pL0 pR0 gamma dL dR parentVar loc mFile refs =
     let next' rL rR = ProductState rL rR pol oneWay gamma dL dR parentVar loc mFile
+        -- An opaque target is an object of its type variable's type. Met with
+        -- another object as that object, the variable is bound like any other:
+        -- to what the other resolves to (not the pointer), only while it isn't
+        -- bound yet.
+        objectOf = \case
+            TargetObject o -> Just o
+            TargetOpaque tid | isRefinable tid -> Map.lookup tid (teVarNodes env)
+            _ -> Nothing
+        (pL, pR) = case (pL0, pR0) of
+            (TargetOpaque a, TargetOpaque b) | a == b -> (pL0, pR0)
+            _ -> case (objectOf pL0, objectOf pR0) of
+                (Just oL, Just oR) -> (TargetObject oL, TargetObject oR)
+                _                  -> (pL0, pR0)
     in case (pL, pR) of
         (TargetObject oL, TargetObject oR) -> do
-            -- Dereferencing a pointer to Bottom is a contradiction (Section 1.B)
-            let nodes = teNodes env
-            botL <- isBot nodes refs dL oL
-            botR <- isBot nodes refs dR oR
-            if pol == PMeet && (botL || botR)
-            then return (Nothing, refs)
-            else do
-                (newRefs, states) <- refineParams env pol oneWay gamma dL dR parentVar loc mFile refs [Covariant] [oL] [oR]
-                case states of
-                    [state] -> return (Just $ TargetObject state, newRefs)
-                    _       -> return (Nothing, refs)
+            -- A pointer to Bottom never gets here: 'stepReference' has already
+            -- collapsed it to Bottom (or a Nonnull contradiction).
+            (newRefs, states) <- refineParams env pol oneWay gamma dL dR parentVar loc mFile refs [Covariant] [oL] [oR]
+            case states of
+                [state] -> return (Just $ TargetObject state, newRefs)
+                _       -> return (Nothing, refs)
         (TargetFunction aL rL, TargetFunction aR rR) ->
             if length aL /= length aR
             then return (Nothing, refs)
             else do
-                (refs1, aStates) <- refineParams env pol oneWay gamma dL dR parentVar loc mFile refs (replicate (length aL) Contravariant) aL aR
+                -- What a function is called with is what the type it's
+                -- taken as gives: a check of a parameter is the other way
+                -- round. Joining two functions takes what both can be called
+                -- with.
+                (refs1, aStates) <- case pol of
+                    PMeet -> refineParams env { teRefineL = teRefineR env, teRefineR = teRefineL env } pol oneWay gamma dR dL parentVar loc mFile refs (replicate (length aL) Covariant) aR aL
+                    PJoin -> refineParams env pol oneWay gamma dL dR parentVar loc mFile refs (replicate (length aL) Contravariant) aL aR
                 (newRefs, mRet) <- refineReturnType env pol oneWay gamma dL dR parentVar loc mFile refs1 rL rR
                 case mRet of
                     Just ret -> return (Just $ TargetFunction aStates ret, newRefs)
                     Nothing  -> return (Nothing, refs)
-        (TargetOpaque tidL, TargetOpaque tidR) | isRefinable tidL && isRefinable tidR ->
-            if tidL == tidR then return (Just $ TargetOpaque tidL, refs)
-            else
-                -- Symmetric variable choice for commutativity and ID invariance.
-                let keyL = variableKey (teNodes env) dL tidL
-                    keyR = variableKey (teNodes env) dR tidR
-                in case (teRefineL env, teRefineR env) of
-                    (True, True) -> do
-                        tell (Set.fromList [keyL, keyR])
-                        let (chosen, !newRefs) = if stableCompareTID (teNodes env) tidL tidR == LT
-                                             then (tidL, setRefinement keyR idL refs)
-                                             else (tidR, setRefinement keyL idR refs)
-                        return (Just $ TargetOpaque chosen, newRefs)
-                    (True, False) -> do
-                        tell (Set.singleton keyL)
-                        let !newRefs = setRefinement keyL idR refs
-                        return (Just $ TargetOpaque tidR, newRefs)
-                    (False, True) -> do
-                        tell (Set.singleton keyR)
-                        let !newRefs = setRefinement keyR idL refs
-                        return (Just $ TargetOpaque tidL, newRefs)
-                    (False, False) ->
-                        return (Just $ TargetOpaque tidL, refs) -- Cannot refine, but they are both refinable names
+        (TargetOpaque tidL, TargetOpaque tidR) | isRefinable tidL && isRefinable tidR && tidL /= tidR ->
+            case (Map.lookup tidL (teVarNodes env), Map.lookup tidR (teVarNodes env)) of
+                (Just vL, Nothing) | teRefineR env -> stepPtrTarget env pol oneWay idL idR (TargetObject vL) pR gamma dL dR parentVar loc mFile refs
+                (Nothing, Just vR) | teRefineL env -> stepPtrTarget env pol oneWay idL idR pL (TargetObject vR) gamma dL dR parentVar loc mFile refs
+                _ ->
+                    -- Neither can be bound to the other's target.
+                    return (Just $ TargetOpaque (if stableCompareTID (teNodes env) tidL tidR == LT then tidL else tidR), refs)
 
         (TargetOpaque tL, TargetOpaque tR) | tL == tR ->
             return (Just $ TargetOpaque tL, refs)
 
+        -- An opaque type variable without a node of its own.
         (TargetOpaque tidL, TargetObject oR) | isRefinable tidL && teRefineL env -> do
             let key = variableKey (teNodes env) dL tidL
-            tell (Set.singleton key)
+            tell (IntSet.singleton key)
+            (effR, _) <- getEffectiveNode (teNodes env) refs dR oR
             case getRefinement key refs of
                 Nothing ->
-                    let !newRefs = setRefinement key oR refs
-                    in return (Just $ TargetObject (next' oR oR), newRefs)
+                    let !newRefs = setRefinement key effR refs
+                    in return (Just $ TargetObject (next' effR effR), newRefs)
                 Just oldID ->
                     return (Just $ TargetObject (next' oldID oR), refs)
 
         (TargetObject oL, TargetOpaque tidR) | isRefinable tidR && teRefineR env -> do
             let key = variableKey (teNodes env) dR tidR
-            tell (Set.singleton key)
+            tell (IntSet.singleton key)
+            (effL, _) <- getEffectiveNode (teNodes env) refs dL oL
             case getRefinement key refs of
                 Nothing ->
-                    let !newRefs = setRefinement key oL refs
-                    in return (Just $ TargetObject (next' oL oL), newRefs)
+                    let !newRefs = setRefinement key effL refs
+                    in return (Just $ TargetObject (next' effL effL), newRefs)
                 Just oldID ->
                     return (Just $ TargetObject (next' oL oldID), refs)
 
@@ -868,7 +974,7 @@ setQuals q (AnyRigidNodeF node) = case node of
     RFunction args ret -> AnyRigidNodeF (RFunction args ret)
     RTerminal t        -> AnyRigidNodeF (RTerminal t)
 
-refineVarL :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> TemplateId -> Maybe (Index TemplateId) -> AnyRigidNodeF TemplateId Word32 -> Writer (Set Int) (StepResult, MappingRefinements)
+refineVarL :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> TemplateId -> Maybe (Index TemplateId) -> AnyRigidNodeF TemplateId Word32 -> Writer IntSet (StepResult, MappingRefinements)
 refineVarL env ps refs tidL idxL nodeR = do
     let nodes = teNodes env
         depthL = psDepthL ps
@@ -882,7 +988,7 @@ refineVarL env ps refs tidL idxL nodeR = do
         qRes = Quals { qConst = if pol == PJoin then qConst qL || qConst qR else qConst qL && qConst qR
                          , qPhysical = if pol == PJoin then qPhysical qL || qPhysical qR else qPhysical qL && qPhysical qR
                          }
-    tell (Set.singleton key)
+    tell (IntSet.singleton key)
     case getRefinement key refs of
         Nothing | psNodeL ps /= psNodeR ps ->
             let resNode = fmap (\i -> ProductState i i pol oneWay gamma depthR depthR (Just (depthL, tidL)) (psOrigin ps) (psFile ps)) nodeR
@@ -897,7 +1003,7 @@ refineVarL env ps refs tidL idxL nodeR = do
              else let resNode = fmap (\i -> ProductState i i pol oneWay gamma depthR depthR (Just (depthL, tidL)) (psOrigin ps) (psFile ps)) nodeR
                   in return (if isObjectAny nodeR then setQuals qRes resNode else resNode, refs)
 
-refineVarR :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> TemplateId -> Maybe (Index TemplateId) -> AnyRigidNodeF TemplateId Word32 -> Writer (Set Int) (StepResult, MappingRefinements)
+refineVarR :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> TemplateId -> Maybe (Index TemplateId) -> AnyRigidNodeF TemplateId Word32 -> Writer IntSet (StepResult, MappingRefinements)
 refineVarR env ps refs tidR idxR nodeL = do
     let nodes = teNodes env
         depthL = psDepthL ps
@@ -911,7 +1017,7 @@ refineVarR env ps refs tidR idxR nodeL = do
         qRes = Quals { qConst = if pol == PJoin then qConst qL || qConst qR else qConst qL && qConst qR
                          , qPhysical = if pol == PJoin then qPhysical qL || qPhysical qR else qPhysical qL && qPhysical qR
                          }
-    tell (Set.singleton key)
+    tell (IntSet.singleton key)
     case getRefinement key refs of
         Nothing | psNodeL ps /= psNodeR ps ->
             let resNode = fmap (\i -> ProductState i i pol oneWay gamma depthL depthL (Just (depthR, tidR)) (psOrigin ps) (psFile ps)) nodeL
@@ -955,23 +1061,7 @@ isRefinable = \case
 
 -- | Searches for an existing existential node that wraps a given nominal type name and arity.
 findExistentialPromotion :: TransitionEnv Word32 -> Lexeme TemplateId -> Int -> Maybe (AnyRigidNodeF TemplateId Word32, Word32)
-findExistentialPromotion env lexName arity =
-    let isMatch nid (AnyRigidNodeF (RObject (VExistential tids bodyId) _)) =
-            length tids == arity &&
-            case Map.lookup bodyId (teNodes env) of
-                Just (AnyRigidNodeF (RObject (VNominal n ps) _)) ->
-                    let L _ _ valN = n
-                        L _ _ valLex = lexName
-                        res = valN == valLex && length ps == arity
-                    in dtrace ("findExistentialPromotion: checking " ++ show nid ++ " nominal name=" ++ show valN ++ " match=" ++ show res) res
-                _ -> False
-        isMatch _ _ = False
-        matches = filter (uncurry isMatch) (Map.toList (teNodes env))
-    in dtrace ("findExistentialPromotion: searching for " ++ show (C.lexemeText lexName) ++ " arity=" ++ show arity ++ " in " ++ show (Map.size (teNodes env)) ++ " nodes") $
-       case matches of
-        [] -> Nothing
-        _  -> let (i, n) = List.minimumBy (\(i1, _) (i2, _) -> compare (getStableNodeIdent (teNodes env) i1) (getStableNodeIdent (teNodes env) i2)) matches
-              in Just (n, i)
+findExistentialPromotion env (L _ _ name) arity = Map.lookup (name, arity) (teExistentials env)
 
 -- | Computes a stable unique key for a refinable variable in 'MappingRefinements'.
 -- Absolute level is used for De Bruijn variables to ensure stability.
@@ -1004,7 +1094,12 @@ stepObjectExistential ps refs tidsL bodyL tidsR bodyR qRes =
             next rL rR = ProductState rL rR pol oneWay newGamma newDL newDR (psParentVar ps) (psOrigin ps) (psFile ps)
         in (AnyRigidNodeF (RObject (VExistential tidsL (next bodyL bodyR)) qRes), refs)
 
-stepObjectPackR :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> ObjectStructure TemplateId Word32 -> [TemplateId] -> Word32 -> Quals -> Writer (Set Int) (Maybe (StepResult, MappingRefinements))
+-- | Whether two nominals may be the same type: the same struct, with as
+-- many arguments, or one without any, which matches any instance of it.
+sameNominal :: Lexeme TemplateId -> [a] -> Lexeme TemplateId -> [b] -> Bool
+sameNominal n1 p1 n2 p2 = C.lexemeText n1 == C.lexemeText n2 && (null p1 || null p2 || length p1 == length p2)
+
+stepObjectPackR :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> ObjectStructure TemplateId Word32 -> [TemplateId] -> Word32 -> Quals -> Writer IntSet (Maybe (StepResult, MappingRefinements))
 stepObjectPackR env ps refs sL' tidsR bodyR qRes = do
     let nodes = teNodes env
         depthL = psDepthL ps
@@ -1018,7 +1113,7 @@ stepObjectPackR env ps refs sL' tidsR bodyR qRes = do
             (VVar tid _, _) | (isRefinable tid || isBound tid) && teRefineL env -> True
             (_, Just (VVar tid _)) | (isRefinable tid || isBound tid) && teRefineR env -> True
             (VBuiltin b1, Just (VBuiltin b2)) -> b1 == b2
-            (VNominal n1 p1, Just (VNominal n2 p2)) -> C.lexemeText n1 == C.lexemeText n2 && length p1 == length p2
+            (VNominal n1 p1, Just (VNominal n2 p2)) -> sameNominal n1 p1 n2 p2
             (VEnum n1, Just (VEnum n2)) -> C.lexemeText n1 == C.lexemeText n2
             (VSingleton b1 _, Just (VBuiltin b2)) -> b1 == b2
             (VBuiltin b1, Just (VSingleton b2 _)) -> b1 == b2
@@ -1038,7 +1133,7 @@ stepObjectPackR env ps refs sL' tidsR bodyR qRes = do
                 let next rL rR = ProductState rL rR PMeet oneWay newGamma depthL newDR (psParentVar ps) (psOrigin ps) (psFile ps)
                 in return $ Just (AnyRigidNodeF (RObject (fmap (\idL' -> next idL' bodyR) sL') qRes), refs)
 
-stepObjectPackL :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> [TemplateId] -> Word32 -> ObjectStructure TemplateId Word32 -> Quals -> Writer (Set Int) (Maybe (StepResult, MappingRefinements))
+stepObjectPackL :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> [TemplateId] -> Word32 -> ObjectStructure TemplateId Word32 -> Quals -> Writer IntSet (Maybe (StepResult, MappingRefinements))
 stepObjectPackL env ps refs tidsL bodyL sR' qRes = do
     let nodes = teNodes env
         depthL = psDepthL ps
@@ -1052,7 +1147,7 @@ stepObjectPackL env ps refs tidsL bodyL sR' qRes = do
             (Just (VVar tid _), _) | (isRefinable tid || isBound tid) && teRefineL env -> True
             (_, VVar tid _) | (isRefinable tid || isBound tid) && teRefineR env -> True
             (Just (VBuiltin b1), VBuiltin b2) -> b1 == b2
-            (Just (VNominal n1 p1), VNominal n2 p2) -> C.lexemeText n1 == C.lexemeText n2 && length p1 == length p2
+            (Just (VNominal n1 p1), VNominal n2 p2) -> sameNominal n1 p1 n2 p2
             (Just (VEnum n1), VEnum n2) -> C.lexemeText n1 == C.lexemeText n2
             (Just (VSingleton b1 _), VBuiltin b2) -> b1 == b2
             (Just (VBuiltin b1), VSingleton b2 _) -> b1 == b2
@@ -1070,9 +1165,14 @@ stepObjectPackL env ps refs tidsL bodyL sR' qRes = do
                 let next rL rR = ProductState rL rR PMeet oneWay newGamma newDL depthR (psParentVar ps) (psOrigin ps) (psFile ps)
                 in return $ Just (AnyRigidNodeF (RObject (fmap (bodyL `next`) sR') qRes), refs)
 
-stepObjectNominal :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Lexeme TemplateId -> [Word32] -> Lexeme TemplateId -> [Word32] -> Quals -> Writer (Set Int) (StepResult, MappingRefinements)
-stepObjectNominal env ps refs nameL paramsL nameR paramsR qRes = do
-    let pol = psPolarity ps
+stepObjectNominal :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> Lexeme TemplateId -> [Word32] -> Lexeme TemplateId -> [Word32] -> Quals -> Writer IntSet (StepResult, MappingRefinements)
+stepObjectNominal env ps refs nameL paramsL0 nameR paramsR0 qRes = do
+    -- A nominal without arguments is any instance of it (a struct behind a
+    -- pointer), so the parameters aren't compared.
+    let (paramsL, paramsR)
+            | null paramsL0 || null paramsR0 = ([], [])
+            | otherwise                      = (paramsL0, paramsR0)
+        pol = psPolarity ps
         depthL = psDepthL ps
         depthR = psDepthR ps
         gamma = psGamma ps
@@ -1199,7 +1299,7 @@ stepObjectVariant env ps refs mL mR qRes =
            then (AnyRigidNodeF (RTerminal SConflict), refs)
            else (AnyRigidNodeF (RObject (VVariant mRes) qRes), refs)
 
-stepObjectSizeExpr :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> [(Word32, Integer)] -> [(Word32, Integer)] -> Quals -> Writer (Set Int) (Maybe (StepResult, MappingRefinements))
+stepObjectSizeExpr :: TransitionEnv Word32 -> ProductState -> MappingRefinements -> [(Word32, Integer)] -> [(Word32, Integer)] -> Quals -> Writer IntSet (Maybe (StepResult, MappingRefinements))
 stepObjectSizeExpr env ps refs termsL termsR qRes = do
     let pol = psPolarity ps
         oneWay = psOneWay ps
@@ -1207,7 +1307,7 @@ stepObjectSizeExpr env ps refs termsL termsR qRes = do
         depthL = psDepthL ps
         depthR = psDepthR ps
         nodes = teNodes env
-        getPropIdent :: Word32 -> Writer (Set Int) (PropertyKind, Int)
+        getPropIdent :: Word32 -> Writer IntSet (PropertyKind, Int)
         getPropIdent rId = do
             (effRId, mRNode) <- getEffectiveNode nodes refs (max depthL depthR) rId
             case mRNode of

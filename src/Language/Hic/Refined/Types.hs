@@ -36,7 +36,7 @@ module Language.Hic.Refined.Types
     ) where
 
 import           Data.Aeson         (ToJSON (..))
-import           Data.Hashable      (Hashable)
+import           Data.Hashable      (Hashable (..))
 import           Data.IntMap.Strict (IntMap)
 import           Data.Map.Strict    (Map)
 import qualified Data.Map.Strict    as Map
@@ -237,7 +237,36 @@ data TemplateId
       }
     | TIdInstance Integer    -- ^ Bind to a unique pointer instance ID
     | TIdDeBruijn Word32     -- ^ Canonicalized variable for memoization
-    deriving (Show, Eq, Ord, Generic)
+    deriving (Show, Generic)
 
-instance Hashable TemplateId
+-- | A parameter's hint is only its name for messages: the same parameter can
+-- come with different hints (the name it has at each use), and is still the
+-- same variable, as it is to the solver ('variableKey').
+instance Eq TemplateId where
+    a == b = compare a b == EQ
+
+instance Ord TemplateId where
+    compare (TIdName a) (TIdName b)                 = compare a b
+    compare (TIdParam p i _) (TIdParam q j _)       = compare (p, i) (q, j)
+    compare (TIdSkolem a b c) (TIdSkolem d e f)     = compare (a, b, c) (d, e, f)
+    compare (TIdInstance a) (TIdInstance b)         = compare a b
+    compare (TIdDeBruijn a) (TIdDeBruijn b)         = compare a b
+    compare a b                                     = compare (rank a) (rank b)
+      where
+        rank :: TemplateId -> Int
+        rank = \case
+            TIdName{}     -> 0
+            TIdParam{}    -> 1
+            TIdSkolem{}   -> 2
+            TIdInstance{} -> 3
+            TIdDeBruijn{} -> 4
+
+instance Hashable TemplateId where
+    hashWithSalt s = \case
+        TIdName t        -> s `hashWithSalt` (0 :: Int) `hashWithSalt` t
+        TIdParam p i _   -> s `hashWithSalt` (1 :: Int) `hashWithSalt` p `hashWithSalt` i
+        TIdSkolem a b c  -> s `hashWithSalt` (2 :: Int) `hashWithSalt` a `hashWithSalt` b `hashWithSalt` c
+        TIdInstance i    -> s `hashWithSalt` (3 :: Int) `hashWithSalt` i
+        TIdDeBruijn i    -> s `hashWithSalt` (4 :: Int) `hashWithSalt` i
+
 instance ToJSON TemplateId

@@ -2,6 +2,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 module Language.Hic.Inference.Engine
     ( inferProgram
+    , inferProgramWith
     ) where
 
 import           Control.Monad                             (foldM)
@@ -15,18 +16,23 @@ import qualified Language.Cimple                           as C
 import qualified Language.Cimple.Program                   as Program
 import           Language.Hic.Ast                          (Node, NodeF (..))
 import           Language.Hic.Inference.Context            (Context,
-                                                            collectContext)
+                                                            collectContextWith)
 import           Language.Hic.Inference.Feature            (Feature (..))
 import qualified Language.Hic.Inference.Passes.Iteration   as Iteration
 import qualified Language.Hic.Inference.Passes.Raise       as Raise
 import qualified Language.Hic.Inference.Passes.Scoped      as Scoped
 import qualified Language.Hic.Inference.Passes.TaggedUnion as TaggedUnion
 import           Language.Hic.Inference.Program.Types      (Program (..))
+import qualified Language.Hic.TypeSystem.Core.Base         as TS
 
 -- | Global inference over an entire Program.
 inferProgram :: Program.Program Text -> (Map FilePath [Node (C.Lexeme Text)], [Text])
-inferProgram cprog =
-    let initialCtx = collectContext cprog
+inferProgram cprog = inferProgramWith (TS.collect (Program.toList cprog)) cprog
+
+-- | The same, with the program's type system already worked out.
+inferProgramWith :: TS.TypeSystem -> Program.Program Text -> (Map FilePath [Node (C.Lexeme Text)], [Text])
+inferProgramWith typeSystem cprog =
+    let initialCtx = collectContextWith typeSystem cprog
         wrapNode = hoistFix CimpleNode
         initialProg :: Program (C.Lexeme Text) = Program
             { progAsts = Map.fromList [ (f, map wrapNode ns) | (f, ns) <- Program.toList cprog ]

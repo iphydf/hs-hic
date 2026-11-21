@@ -34,6 +34,23 @@ data ProductState = ProductState
     , psOrigin    :: Maybe (Lexeme Text)               -- ^ Source location of the constraint that triggered this state
     , psFile      :: Maybe FilePath                    -- ^ Source file of the constraint
     }
-    deriving (Show, Eq, Ord, Generic)
+    deriving (Show, Generic)
+
+-- | States are the same sub-problem whatever constraint reached them first:
+-- the source location is only for diagnostics. Compared field by field, as
+-- this is the solver's hottest comparison.
+instance Eq ProductState where
+    a == b = compare a b == EQ
+
+instance Ord ProductState where
+    compare a b =
+        compare (psNodeL a) (psNodeL b)
+        <> compare (psNodeR a) (psNodeR b)
+        <> compare (psPolarity a) (psPolarity b)
+        <> compare (psOneWay a) (psOneWay b)
+        <> compare (psGamma a) (psGamma b)
+        <> compare (psDepthL a) (psDepthL b)
+        <> compare (psDepthR a) (psDepthR b)
+        <> compare (psParentVar a) (psParentVar b)
 
 instance ToJSON ProductState

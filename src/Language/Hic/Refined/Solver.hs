@@ -10,7 +10,7 @@ module Language.Hic.Refined.Solver
     , FilterResult (..)
     , Constraint (..)
     , solve
-    , runWorklist
+    , solveAll
     ) where
 
 import qualified Data.IntMap.Merge.Strict         as IntMap
@@ -26,18 +26,22 @@ import           Data.Text                        (Text)
 import           Data.Word                        (Word32)
 import qualified Debug.Trace                      as Debug
 import           GHC.Generics                     (Generic)
-import           Language.Cimple                  (Lexeme)
+import           Language.Cimple                  (Lexeme (..))
+import qualified Language.Cimple                  as C
 import           Language.Hic.Refined.Context     (MappingContext,
                                                    MappingRefinements (..),
+                                                   changedKeys, clearChanged,
                                                    emptyContext,
-                                                   emptyRefinements, mrHash,
+                                                   emptyRefinements,
+                                                   getRefinement, mrHash,
                                                    mrRefinements, setRefinement)
 import           Language.Hic.Refined.LatticeOp   (Polarity (..))
 import           Language.Hic.Refined.PathContext (PathContext (..), emptyPath)
 import           Language.Hic.Refined.Registry    (Registry)
 import           Language.Hic.Refined.State       (ProductState (..))
 import           Language.Hic.Refined.Transition  (TransitionEnv (..),
-                                                   isRefinable, step,
+                                                   betterBinding, isRefinable,
+                                                   step, transitionEnv,
                                                    variableKey)
 import           Language.Hic.Refined.Types       (AnyRigidNodeF (..),
                                                    ObjectStructure (..),
@@ -81,22 +85,64 @@ data Constraint
     | CInherit Word32 Word32 (Maybe (Lexeme Text)) FilePath
     deriving (Show, Eq, Ord, Generic)
 
--- | Executes the project-wide fixpoint solver on a set of constraints.
+-- | Executes the project-wide fixpoint solver on a set of constraints: the
+-- first conflict it meets, or the refinements. It stops there, so the
+-- conflict can be with a binding that 'solveAll' would replace later.
 solve :: Registry Word32
       -> Map Word32 (AnyRigidNodeF TemplateId Word32)
       -> [Constraint]
       -> (Word32, Word32, Word32, Word32) -- ^ (Bottom, Any, Conflict, STerminal) IDs
       -> Either ProductState MappingRefinements
 solve registry nodes constraints terminals =
-    let toProductState = \case
-            CSubtype l r pol gamma _ dL dR loc file -> ProductState l r pol False gamma dL dR Nothing loc (Just file)
-            CInherit l r loc file                   -> ProductState l r PMeet True  emptyContext 0 0 Nothing loc (Just file)
-        getPathCtx = \case
-            CSubtype _ _ _ _ c _ _ _ _ -> c
-            CInherit _ _ _ _           -> PathContext Map.empty Map.empty
-        constraintMap = Map.fromList [ (toProductState c, getPathCtx c) | c <- constraints ]
+    let constraintMap = Map.fromList [ (constraintState c, constraintPathContext c) | c <- constraints ]
         topLevel = Map.keysSet constraintMap
-    in runWorklist registry nodes constraintMap topLevel terminals emptyRefinements topLevel Set.empty IntMap.empty Map.empty
+    in case worklist (baseEnv registry nodes terminals) True 0 Map.empty Map.empty constraintMap emptyRefinements topLevel Set.empty IntMap.empty Map.empty of
+        (_, Just ps, _, _, _)    -> Left ps
+        (_, Nothing, refs, _, _) -> Right refs
+
+-- | Like 'solve', but returns all conflicts, with the number of states it
+-- processed, in all and by the source line (file, line) of the constraint each
+-- state came from. A conflicting state refines nothing, so one conflict
+-- doesn't cause others.
+--
+-- The conflicts are the solution's: the states the constraints reach with the
+-- final refinements, that conflict with them. On the way, a state can
+-- conflict with a binding that a better one replaces later (see
+-- 'betterBinding'); it's then stepped again, or no longer reached.
+--
+-- A variable made for a declaration is bound to the type it's declared with
+-- from the start, and stays so: what's assigned to it is checked against its
+-- declaration, whatever the solver meets first.
+solveAll :: Registry Word32
+         -> Map Word32 (AnyRigidNodeF TemplateId Word32)
+         -> [(Word32, Word32)] -- ^ (variable, declared type) of each declaration
+         -> [Constraint]
+         -> (Word32, Word32, Word32, Word32) -- ^ (Bottom, Any, Conflict, STerminal) IDs
+         -> ([(ProductState, ProductState)], MappingRefinements, Int, Map (Maybe FilePath, Int) Int)
+solveAll registry nodes definitions constraints terminals =
+    let constraintMap = Map.fromList [ (constraintState c, constraintPathContext c) | c <- constraints ]
+        topLevel = Map.keysSet constraintMap
+        declared = [ (variableKey nodes 0 tid, ty) | (var, ty) <- definitions, Just (AnyRigidNodeF (RObject (VVar tid _) _)) <- [Map.lookup var nodes] ]
+        initialRefs = clearChanged (foldr (uncurry setRefinement) emptyRefinements declared)
+        env = (baseEnv registry nodes terminals) { teFixed = IntSet.fromList (map fst declared) }
+        (results, _, refs, steps, origins) =
+            worklist env False 0 Map.empty Map.empty constraintMap initialRefs topLevel Set.empty IntMap.empty Map.empty
+    in (finalConflicts results topLevel, refs, steps, origins)
+
+-- | The environment of every step, with the graph's indexes built once: each
+-- step sets its own polarity, path context and which sides it refines.
+baseEnv :: Registry Word32 -> Map Word32 (AnyRigidNodeF TemplateId Word32) -> (Word32, Word32, Word32, Word32) -> TransitionEnv Word32
+baseEnv registry nodes terminals = transitionEnv nodes registry PMeet (PathContext Map.empty Map.empty) emptyPath terminals True True
+
+constraintState :: Constraint -> ProductState
+constraintState = \case
+    CSubtype l r pol gamma _ dL dR loc file -> ProductState l r pol False gamma dL dR Nothing loc (Just file)
+    CInherit l r loc file                   -> ProductState l r PMeet True  emptyContext 0 0 Nothing loc (Just file)
+
+constraintPathContext :: Constraint -> PathContext
+constraintPathContext = \case
+    CSubtype _ _ _ _ c _ _ _ _ -> c
+    CInherit _ _ _ _           -> PathContext Map.empty Map.empty
 
 terminalToId :: TerminalNode a -> (Word32, Word32, Word32, Word32) -> Maybe Word32
 terminalToId term (bot, any', conflict, _) = case term of
@@ -105,86 +151,100 @@ terminalToId term (bot, any', conflict, _) = case term of
     SConflict   -> Just conflict
     STerminal{} -> Nothing
 
--- | Core worklist loop for the Product Automaton.
--- Only moves UP the lattice. Restarts on refinement changes to ensure consistency.
-runWorklist :: Registry Word32
-            -> Map Word32 (AnyRigidNodeF TemplateId Word32)
+-- | The latest step of each state: whether it conflicted, and the states it
+-- leads to.
+type Results = Map ProductState (Bool, [ProductState])
+
+-- | The conflicting states the constraints reach through each state's latest
+-- step, each once, as first reached, with the constraint it was reached from.
+finalConflicts :: Results -> Set ProductState -> [(ProductState, ProductState)]
+finalConflicts results = go Set.empty [] . map (\c -> (c, c)) . Set.toList
+  where
+    go _ acc [] = reverse acc
+    go seen acc ((ps, root):rest)
+        | ps `Set.member` seen = go seen acc rest
+        | otherwise = case Map.lookup ps results of
+            Just (True, _)         -> go seen' ((ps, root) : acc) rest
+            Just (False, children) -> go seen' acc (map (\c -> (c, root)) children ++ rest)
+            Nothing                -> go seen' acc rest
+      where
+        seen' = Set.insert ps seen
+
+-- | The worklist loop: steps states until none is left whose refinements
+-- changed since its latest step. With @stopAtFirst@, it stops at the first
+-- conflict it meets.
+worklist :: TransitionEnv Word32 -> Bool -> Int -> Map (Maybe FilePath, Int) Int -> Results
             -> Map ProductState PathContext
-            -> Set ProductState
-            -> (Word32, Word32, Word32, Word32)
             -> MappingRefinements
             -> Set ProductState
             -> Set ProductState
             -> IntMap (Set ProductState)
-            -> Map ProductState (Set Int)
-            -> Either ProductState MappingRefinements
-runWorklist registry nodes constraints topLevel terminals !refs worklist visited deps revDeps
-    | Set.null worklist = Right refs
+            -> Map ProductState IntSet
+            -> (Results, Maybe ProductState, MappingRefinements, Int, Map (Maybe FilePath, Int) Int)
+worklist env0 stopAtFirst !steps !origins !results constraints !refs work visited deps revDeps
+    | Set.null work = (results, Nothing, refs, steps, origins)
     | otherwise =
-        let (ps, rest) = Set.deleteFindMin worklist
+        let nodes = teNodes env0
+            terminals = teTerminals env0
+            (ps, rest) = Set.deleteFindMin work
         in if ps `Set.member` visited
-           then runWorklist registry nodes constraints topLevel terminals refs rest visited deps revDeps
+           then worklist env0 stopAtFirst steps origins results constraints refs rest visited deps revDeps
            else dtrace ("solve step: " ++ show (psNodeL ps, psNodeR ps, psPolarity ps)) $
                let pathCtx = Map.findWithDefault (PathContext Map.empty Map.empty) ps { psParentVar = Nothing } constraints
                    (refineL, refineR) = (True, not (psOneWay ps))
-                   env = TransitionEnv nodes registry (psPolarity ps) pathCtx emptyPath terminals refineL refineR
+                   env = env0 { tePolarity = psPolarity ps, tePathCtx = pathCtx, teRefineL = refineL, teRefineR = refineR }
 
                    -- Special handling for CInherit: Don't refine psNodeR
-                   (result, !newRefsStep, psDeps) = step env ps refs
+                   (result, !newRefsStep, psDeps) = step env ps (clearChanged refs)
+                   !origins' = Map.insertWith (+) (psFile ps, maybe 0 (\(L (C.AlexPn _ line _) _ _) -> line) (psOrigin ps)) 1 origins
 
                    -- Update dependency tracking
-                   oldDeps = Map.findWithDefault Set.empty ps revDeps
+                   oldDeps = Map.findWithDefault IntSet.empty ps revDeps
                    !newDepsMap = if oldDeps == psDeps then deps
-                                 else foldr (\k m -> IntMap.insertWith Set.union k (Set.singleton ps) m)
-                                            (foldr (\k m -> IntMap.update (\s -> let s' = Set.delete ps s in if Set.null s' then Nothing else Just s') k m) deps oldDeps)
+                                 else IntSet.foldr (\k m -> IntMap.insertWith Set.union k (Set.singleton ps) m)
+                                            (IntSet.foldr (\k m -> IntMap.update (\s -> let s' = Set.delete ps s in if Set.null s' then Nothing else Just s') k m) deps oldDeps)
                                             psDeps
                    !newRevDeps = if oldDeps == psDeps then revDeps else Map.insert ps psDeps revDeps
 
-                   requeue changedRefs oldRefs currentWorklist currentVisited currentDeps =
-                       let !changedKeys = IntMap.merge IntMap.preserveMissing IntMap.dropMissing
-                                          (IntMap.zipWithMaybeMatched (\_ v1 v2 -> if v1 == v2 then Nothing else Just v1))
-                                          (mrRefinements changedRefs) (mrRefinements oldRefs)
-                           !affectedStates = IntMap.foldlWithKey' (\acc k _ -> Set.union acc (IntMap.findWithDefault Set.empty k currentDeps)) Set.empty changedKeys
-                       in if Set.null affectedStates
-                          then (currentWorklist, currentVisited)
-                          else (Set.union currentWorklist affectedStates, Set.difference currentVisited affectedStates)
+                   -- Steps the states whose refinements changed again, and the
+                   -- states this one leads to.
+                   continue refs' children =
+                       let !results' = Map.insert ps (False, children) results
+                           visited' = Set.insert ps visited
+                           work' = Set.union rest (Set.fromList children)
+                       in if mrHash refs' == mrHash refs
+                          then worklist env0 stopAtFirst (steps + 1) origins' results' constraints refs work' visited' newDepsMap newRevDeps
+                          else
+                              let !affected = IntSet.foldl' (\acc k -> Set.union acc (IntMap.findWithDefault Set.empty k newDepsMap)) Set.empty (changedKeys refs')
+                              in worklist env0 stopAtFirst (steps + 1) origins' results' constraints refs' (Set.union work' affected) (Set.difference visited' affected) newDepsMap newRevDeps
 
                in dtrace ("solve step: " ++ show ps ++ " -> res: " ++ show result) $ case result of
                    AnyRigidNodeF (RTerminal SConflict) ->
-                       let nodeL = Map.lookup (psNodeL ps) nodes
-                           nodeR = Map.lookup (psNodeR ps) nodes
-                       in dtrace ("CONFLICT at " ++ show ps ++ "\n  Origin: " ++ show (psOrigin ps) ++ "\n  NodeL: " ++ show nodeL ++ "\n  NodeR: " ++ show nodeR) (Left ps)
+                       dtrace ("CONFLICT at " ++ show ps ++ "\n  Origin: " ++ show (psOrigin ps)) $
+                       if stopAtFirst then (results, Just ps, refs, steps + 1, origins')
+                       else worklist env0 stopAtFirst (steps + 1) origins' (Map.insert ps (True, []) results) constraints refs rest (Set.insert ps visited) newDepsMap newRevDeps
                    AnyRigidNodeF (RTerminal term) | Just termId <- terminalToId term terminals ->
-                       let refsParent = case psParentVar ps of
+                       -- The variables this state is about are that terminal,
+                       -- unless they're bound to something better already.
+                       let bindTerminal key r
+                               | IntSet.member key (teFixed env0) = r
+                               | otherwise = case getRefinement key refs of
+                                   Just current | not (betterBinding nodes termId current) -> r
+                                   _ -> setRefinement key termId r
+                           refsParent = case psParentVar ps of
                                Just (d, tid) | psPolarity ps == PMeet ->
                                    dtrace ("Refining Parent " ++ show tid ++ " at depth " ++ show d ++ " to " ++ show termId) $
-                                   setRefinement (variableKey nodes d tid) termId newRefsStep
+                                   bindTerminal (variableKey nodes d tid) newRefsStep
                                _ -> newRefsStep
                            refsL = case Map.lookup (psNodeL ps) nodes of
                                Just (AnyRigidNodeF (RObject (VVar tid _) _)) | isRefinable tid && psPolarity ps == PMeet && refineL ->
                                    dtrace ("Refining L " ++ show tid ++ " to " ++ show termId) $
-                                   setRefinement (variableKey nodes (psDepthL ps) tid) termId refsParent
+                                   bindTerminal (variableKey nodes (psDepthL ps) tid) refsParent
                                _ -> refsParent
                            refsR = case Map.lookup (psNodeR ps) nodes of
                                Just (AnyRigidNodeF (RObject (VVar tid _) _)) | isRefinable tid && psPolarity ps == PMeet && refineR ->
                                    dtrace ("Refining R " ++ show tid ++ " to " ++ show termId) $
-                                   setRefinement (variableKey nodes (psDepthR ps) tid) termId refsL
+                                   bindTerminal (variableKey nodes (psDepthR ps) tid) refsL
                                _ -> refsL
-                       in if mrHash refsR /= mrHash refs
-                          then let (newWorklist, newVisited) = requeue refsR refs rest (Set.insert ps visited) newDepsMap
-                                   children = Set.fromList $ foldMap (:[]) (AnyRigidNodeF (RTerminal term))
-                                   finalWorklist = Set.union newWorklist children
-                               in runWorklist registry nodes constraints topLevel terminals refsR finalWorklist newVisited newDepsMap newRevDeps
-                          else let children = Set.fromList $ foldMap (:[]) (AnyRigidNodeF (RTerminal term))
-                                   newWorklist = Set.union rest children
-                               in runWorklist registry nodes constraints topLevel terminals refsR newWorklist (Set.insert ps visited) newDepsMap newRevDeps
-                   AnyRigidNodeF n ->
-                       if mrHash newRefsStep /= mrHash refs
-                       then let (newWorklist, newVisited) = requeue newRefsStep refs rest (Set.insert ps visited) newDepsMap
-                                children = Set.fromList $ foldMap (:[]) n
-                                finalWorklist = Set.union newWorklist children
-                            in runWorklist registry nodes constraints topLevel terminals newRefsStep finalWorklist newVisited newDepsMap newRevDeps
-                       else
-                           let children = Set.fromList $ foldMap (:[]) n
-                               newWorklist = Set.union rest children
-                           in runWorklist registry nodes constraints topLevel terminals refs newWorklist (Set.insert ps visited) newDepsMap newRevDeps
+                       in continue refsR []
+                   AnyRigidNodeF n -> continue newRefsStep (foldMap (:[]) n)

@@ -46,6 +46,7 @@ import           Control.Monad              (foldM)
 import           Data.Fix                   (Fix (Fix, unFix))
 import           Data.Foldable              (foldl')
 import           Data.Kind                  (Type)
+import           Data.List                  (partition)
 import           Data.Map.Strict            (Map)
 import qualified Data.Map.Strict            as Map
 import           Data.Maybe                 (mapMaybe)
@@ -95,6 +96,25 @@ class (Eq a, Show a, Monad m, Ord callCtx) => DataFlow m (c :: Type -> Type) l a
     -- This is used at control flow merge points (e.g., after an if-statement
     -- or at the start of a loop).
     join :: c l -> a -> a -> m a
+    -- | The join where a loop goes back to: the same, unless something is
+    -- worth working out only there.
+    joinLoop :: c l -> a -> a -> m a
+    joinLoop = join
+    -- | The join where a loop goes back to, of what comes in from before the
+    -- loop and what comes back round it, given the statements in the loop.
+    joinLoopHead :: c l -> [C.Node (C.Lexeme l)] -> a -> a -> m a
+    joinLoopHead ctx _ = joinLoop ctx
+    -- | Widening: given a block's old entry facts and the newly joined ones,
+    -- what to use instead once they have changed often. Facts that
+    -- change every time round a loop (a pointer moved forward each time)
+    -- must jump to something stable here, or the fixpoint never ends.
+    widen :: c l -> a -> a -> m a
+    widen _ _ new = return new
+    -- | Widening where a loop goes back to, given the statements in the
+    -- loop: what the loop doesn't change needn't be widened there, as it
+    -- only changes where something round it does.
+    widenLoop :: c l -> [C.Node (C.Lexeme l)] -> a -> a -> m a
+    widenLoop ctx _ = widen ctx
 
 -- | A generic fixpoint solver for forward data flow analysis. This function
 -- iteratively applies the transfer function to each node in the CFG until
@@ -105,17 +125,42 @@ fixpoint ctx funcName (cfg :: CFG l a) =
     let
         worklist = fromList (Map.keys cfg)
     in
-        go worklist cfg Set.empty
+        go worklist cfg Map.empty Set.empty False
     where
-        go :: Worklist Int -> CFG l a -> Set (l, callCtx) -> m (CFG l a, Set (l, callCtx))
-        go worklist cfg' accumulatedWork
+        -- | How many times a block's entry facts change before they're widened.
+        widenAfter = 2 :: Int
+        -- | How many times every block is worked out again after widening,
+        -- from what's known then: each time is still true of every run, and
+        -- gets back some of what widening gave up.
+        descents = 2 :: Int
+
+        (heads, order) = loopHeads cfg
+        bodies = loopBodies cfg
+        loopStmts h = concatMap cfgStmts (mapMaybe (`Map.lookup` cfg) (Set.toList (Map.findWithDefault Set.empty h bodies)))
+
+        joinedFacts :: CFG l a -> CFGNode l a -> m a
+        joinedFacts cfg' node = case mapMaybe (`Map.lookup` cfg') (cfgPreds node) of
+            []                    -> return $ cfgInFacts node
+            preds | Set.member h heads, (back@(_:_), entry@(_:_)) <- partition ((`Set.member` body) . cfgNodeId) preds -> do
+                before <- joinAll (joinLoop ctx) entry
+                round' <- joinAll (joinLoop ctx) back
+                joinLoopHead ctx (loopStmts h) before round'
+            preds -> joinAll (if Set.member h heads then joinLoop ctx else join ctx) preds
+          where
+            h = cfgNodeId node
+            body = Map.findWithDefault Set.empty h bodies
+            joinAll joining (p : ps) = foldM joining (cfgOutFacts p) (map cfgOutFacts ps)
+            joinAll _ []             = return $ cfgInFacts node
+
+        go :: Worklist Int -> CFG l a -> Map Int Int -> Set (l, callCtx) -> Bool -> m (CFG l a, Set (l, callCtx))
+        go worklist cfg' changeCounts accumulatedWork widened
             | Just (currentId, worklist') <- pop worklist = do
                 let node = lookupOrError "fixpoint" cfg' currentId
-                let predNodes = mapMaybe (`Map.lookup` cfg') (cfgPreds node)
+                let timesChanged = Map.findWithDefault 0 currentId changeCounts
+                let widening = timesChanged >= widenAfter && Set.member currentId heads
 
-                inFacts' <- case predNodes of
-                    [] -> return $ cfgInFacts node
-                    (firstPred:restPreds) -> foldM (join ctx) (cfgOutFacts firstPred) (map cfgOutFacts restPreds)
+                joined <- joinedFacts cfg' node
+                inFacts' <- if widening then widenLoop ctx (loopStmts currentId) (cfgInFacts node) joined else return joined
 
                 (outFacts', blockWork) <-
                     foldM
@@ -136,8 +181,72 @@ fixpoint ctx funcName (cfg :: CFG l a) =
                         then pushList (cfgSuccs node) worklist'
                         else worklist'
                 let accumulatedWork' = Set.union accumulatedWork blockWork
-                go worklist'' cfg'' accumulatedWork'
+                -- Reached for the first time isn't a change.
+                let changedFromKnown = inFacts' /= cfgInFacts node && cfgInFacts node /= cfgInFacts (lookupOrError "fixpoint" cfg currentId)
+                let timesChanged' = if changedFromKnown then timesChanged + 1 else timesChanged
+                go worklist'' cfg'' (Map.insert currentId timesChanged' changeCounts) accumulatedWork' (widened || widening)
+            | widened = descend descents cfg' accumulatedWork
             | otherwise = return (cfg', accumulatedWork)
+
+        descend :: Int -> CFG l a -> Set (l, callCtx) -> m (CFG l a, Set (l, callCtx))
+        descend n cfg' accumulatedWork
+            | n <= 0 = return (cfg', accumulatedWork)
+            | otherwise = do
+                (cfg'', work) <- foldM again (cfg', accumulatedWork) order
+                if cfg'' == cfg' then return (cfg'', work) else descend (n - 1) cfg'' work
+        again (cfg', work) nodeId = do
+            let node = lookupOrError "fixpoint" cfg' nodeId
+            inFacts' <- joinedFacts cfg' node
+            (outFacts', blockWork) <-
+                foldM
+                    (\(accFacts, accWork) stmt -> do
+                        (newFacts, newWork) <- transfer ctx funcName (cfgNodeId node) accFacts stmt
+                        return (newFacts, Set.union accWork newWork))
+                    (inFacts', Set.empty)
+                    (cfgStmts node)
+            return (Map.insert nodeId node { cfgInFacts = inFacts', cfgOutFacts = outFacts' } cfg', Set.union work blockWork)
+
+-- | The blocks a loop goes back to, which are the only ones widened, and
+-- every block in an order where one comes before what follows it, but for
+-- going back round a loop: from a walk along the graph from the first block
+-- (and from any it doesn't reach).
+loopHeads :: CFG l a -> (Set Int, [Int])
+loopHeads cfg =
+    let (_, heads, post) = foldl' (visit Set.empty) (Set.empty, Set.empty, []) (Map.keys cfg)
+    in (heads, post)
+  where
+    visit onPath (seen, heads, post) n
+        | Set.member n seen = (seen, heads, post)
+        | otherwise =
+            let onPath' = Set.insert n onPath
+                step acc@(seen', heads', post') s
+                    | Set.member s onPath' = (seen', Set.insert s heads', post')
+                    | otherwise = visit onPath' acc s
+                (seen'', heads'', post'') = foldl' step (Set.insert n seen, heads, post) (maybe [] cfgSuccs (Map.lookup n cfg))
+            in (seen'', heads'', n : post'')
+
+-- | The blocks of each loop, by the block it goes back to: those from
+-- which a block going back to it can be reached without passing it.
+loopBodies :: CFG l a -> Map Int (Set Int)
+loopBodies cfg = Map.fromListWith Set.union [ (h, body h src) | (src, h) <- backEdges ]
+  where
+    backEdges = let (_, es) = foldl' (visit Set.empty) (Set.empty, []) (Map.keys cfg) in es
+    visit onPath (seen, es) n
+        | Set.member n seen = (seen, es)
+        | otherwise =
+            let onPath' = Set.insert n onPath
+                step acc@(seen', es') s
+                    | Set.member s onPath' = (seen', (n, s) : es')
+                    | otherwise = visit onPath' acc s
+            in foldl' step (Set.insert n seen, es) (maybe [] cfgSuccs (Map.lookup n cfg))
+    body h src = go (Set.fromList [h, src]) [src]
+      where
+        go acc [] = acc
+        go acc (x : xs)
+            | x == h = go acc xs
+            | otherwise =
+                let new = [ p | p <- maybe [] cfgPreds (Map.lookup x cfg), Set.notMember p acc ]
+                in go (foldr Set.insert acc new) (new ++ xs)
 
 -- | Build a control flow graph for a function definition. This is the main
 -- entry point for constructing a CFG from a Cimple AST.

@@ -783,7 +783,7 @@ replaceVoidWithTemplate t                    = return t
 
 -- | Add array dimensions to a type
 addArrays :: TypeInfo 'Local -> [Node (Lexeme Text)] -> TypeCheck (TypeInfo 'Local)
-addArrays = foldM add
+addArrays ty0 dims = TS.declaredArray dims <$> foldM add ty0 dims
   where
     add ty (Fix (DeclSpecArray _ (Just n))) = case unFix n of
         LiteralExpr C.Int l -> return $ Array (Just ty) [IntLit (fmap TS.mkId l)]
@@ -1355,11 +1355,16 @@ collectDefinitions = mapM_ collectDef
     collectEnumNames _                         = []
 
     getParamType :: Node (Lexeme Text) -> Node (Lexeme Text)
-    getParamType (Fix (VarDecl ty _ arrs)) = foldr (\_ t -> Fix (TyPointer t)) ty arrs
+    -- An array parameter is a pointer, with the nullability its brackets say.
+    getParamType (Fix (VarDecl ty _ arrs)) = bracketNullability arrs (foldr (\_ t -> Fix (TyPointer t)) ty arrs)
     getParamType (Fix (CallbackDecl (L _ _ ty) _)) = Fix (TyFunc (L (C.AlexPn 0 0 0) C.IdVar ty))
     getParamType (Fix (NonNullParam p)) = getParamType p
     getParamType (Fix (NullableParam p)) = getParamType p
     getParamType t                      = t -- Should handle more cases
+
+    bracketNullability (Fix (DeclSpecArray C.Nullable _) : _) t = Fix (TyNullable t)
+    bracketNullability (Fix (DeclSpecArray C.Nonnull _) : _) t  = Fix (TyNonnull t)
+    bracketNullability _ t                                      = t
 
     collectMember (Fix (MemberDecl (Fix (VarDecl ty (L _ _ name) arrs)) _)) = do
         t <- convertToTypeInfo ty >>= flip addArrays arrs
